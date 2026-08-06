@@ -1,15 +1,22 @@
-//! macos-proc-monitor — collects per-process metrics every second, writes to DuckDB.
+//! macos-proc-monitor — collects per-process metrics every second, writes partitioned Parquet.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Local;
+use arrow::array::{
+    Float32Array, Float64Array, StringArray, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use chrono::{Local, Utc};
 use clap::Parser;
-use duckdb::{params, Connection};
+use parquet::arrow::ArrowWriter;
 use serde::Serialize;
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 use tracing::{debug, error, info};
@@ -23,7 +30,7 @@ use uzers::get_user_by_uid;
 #[derive(Parser, Debug)]
 #[command(
     name = "macos-proc-monitor",
-    about = "Collect per-process metrics every second, write to DuckDB",
+    about = "Collect per-process metrics every second, write to partitioned Parquet files",
     long_about = None,
     version
 )]
@@ -55,13 +62,17 @@ struct Args {
     /// Delete log files older than this many days (0 = keep forever)
     #[arg(long, default_value = "7")]
     log_retention: u64,
+
+    /// How often (in seconds) to flush buffered records to Parquet
+    #[arg(long, default_value = "30")]
+    flush_interval: u64,
 }
 
 // ---------------------------------------------------------------------------
-// Record struct (used for building, not serialized to JSON for writing)
+// Record struct
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ProcRecord {
     ts: f64,
     pid: u32,
@@ -89,6 +100,11 @@ fn unix_now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Return current UTC hour string: "YYYY-MM-DDTHH"
+fn current_hour() -> String {
+    Utc::now().format("%Y-%m-%dT%H").to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +227,6 @@ fn default_dir(env_var: &str, subdir: &str) -> PathBuf {
     if let Ok(v) = std::env::var(env_var) {
         return PathBuf::from(v);
     }
-    // Under launchd, HOME may be unset — fall back to /var/db/macos-proc-monitor
     if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home)
             .join(".cache")
@@ -223,7 +238,7 @@ fn default_dir(env_var: &str, subdir: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Purge log files older than retention_days
+// Purge files older than retention_days
 // ---------------------------------------------------------------------------
 
 fn purge_old_files(dir: &PathBuf, ext: &str, retention_days: u64) {
@@ -349,6 +364,85 @@ fn init_logging(log_dir: &PathBuf, retention_days: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Parquet schema
+// ---------------------------------------------------------------------------
+
+fn parquet_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("ts",           DataType::Float64, false),
+        Field::new("pid",          DataType::UInt32,  false),
+        Field::new("ppid",         DataType::UInt32,  true),
+        Field::new("name",         DataType::Utf8,    true),
+        Field::new("user_name",    DataType::Utf8,    true),
+        Field::new("status",       DataType::Utf8,    true),
+        Field::new("cpu_percent",  DataType::Float32, true),
+        Field::new("mem_rss",      DataType::UInt64,  false),
+        Field::new("mem_vms",      DataType::UInt64,  false),
+        Field::new("num_threads",  DataType::UInt64,  false),
+        Field::new("create_time",  DataType::Float64, false),
+        Field::new("cwd",          DataType::Utf8,    true),
+        Field::new("num_fds",      DataType::UInt32,  true),
+        Field::new("children",     DataType::Utf8,    true),
+    ]))
+}
+
+// ---------------------------------------------------------------------------
+// Write a batch of records to a new Parquet file
+// ---------------------------------------------------------------------------
+
+fn write_parquet(path: &PathBuf, records: &[ProcRecord]) -> Result<(), Box<dyn std::error::Error>> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let schema = parquet_schema();
+    let file = File::create(path)?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+
+    let children_strs: Vec<String> = records
+        .iter()
+        .map(|r| serde_json::to_string(&r.children).unwrap_or_else(|_| "[]".into()))
+        .collect();
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Float64Array::from(records.iter().map(|r| r.ts).collect::<Vec<_>>())),
+            Arc::new(UInt32Array::from(records.iter().map(|r| r.pid).collect::<Vec<_>>())),
+            Arc::new(UInt32Array::from(records.iter().map(|r| r.ppid).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                records.iter().map(|r| Some(r.name.as_str())).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records.iter().map(|r| r.user.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records.iter().map(|r| Some(r.status.as_str())).collect::<Vec<_>>(),
+            )),
+            Arc::new(Float32Array::from(
+                records.iter().map(|r| Some(r.cpu_percent)).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(records.iter().map(|r| r.mem_rss).collect::<Vec<_>>())),
+            Arc::new(UInt64Array::from(records.iter().map(|r| r.mem_vms).collect::<Vec<_>>())),
+            Arc::new(UInt64Array::from(records.iter().map(|r| r.num_threads).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(records.iter().map(|r| r.create_time).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                records.iter().map(|r| r.cwd.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                records.iter().map(|r| r.num_fds).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                children_strs.iter().map(|s| Some(s.as_str())).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Build a ProcRecord from sysinfo data
 // ---------------------------------------------------------------------------
 
@@ -412,7 +506,7 @@ fn reachable_pids(root: u32, children_map: &HashMap<u32, Vec<u32>>) -> Vec<u32> 
 fn main() {
     let args = Args::parse();
 
-    let log_dir = default_dir("MACOS_PROC_MONITOR_FOLDER_LOG", "logs");
+    let log_dir  = default_dir("MACOS_PROC_MONITOR_FOLDER_LOG", "logs");
     let data_dir = default_dir("MACOS_PROC_MONITOR_FOLDER_DATA", "data");
 
     if let Err(e) = fs::create_dir_all(&log_dir) {
@@ -424,32 +518,13 @@ fn main() {
 
     init_logging(&log_dir, args.log_retention);
 
-    // --- open DuckDB ---
-    let db_path = data_dir.join("procs.duckdb");
-    let mut conn = Connection::open(&db_path).expect("cannot open DuckDB");
-
-    conn.execute_batch("
-        CREATE TABLE IF NOT EXISTS proc_metrics (
-            ts           DOUBLE NOT NULL,
-            pid          UINTEGER NOT NULL,
-            ppid         UINTEGER,
-            name         VARCHAR,
-            user_name    VARCHAR,
-            status       VARCHAR,
-            cpu_percent  FLOAT,
-            mem_rss      UBIGINT,
-            mem_vms      UBIGINT,
-            num_threads  UBIGINT,
-            create_time  DOUBLE,
-            cwd          VARCHAR,
-            num_fds      UINTEGER,
-            children     VARCHAR
-        );
-    ").expect("cannot create table");
-
     info!("macos-proc-monitor starting");
     info!("log  -> {}/monitor-<date>.log", log_dir.display());
-    info!("data -> {}", db_path.display());
+    info!(
+        "data -> {}/ (parquet, flush every {}s)",
+        data_dir.display(),
+        args.flush_interval
+    );
     info!(
         "interval={}s  slow-interval={}s  sudo={}  no-slow={}",
         args.interval, args.slow_interval, args.sudo, args.no_slow
@@ -460,8 +535,9 @@ fn main() {
         if args.log_retention == 0 { "inf".to_string() } else { args.log_retention.to_string() },
     );
 
-    let interval = Duration::from_secs_f64(args.interval.max(0.1));
-    let slow_every = Duration::from_secs(args.slow_interval.max(1));
+    let interval     = Duration::from_secs_f64(args.interval.max(0.1));
+    let slow_every   = Duration::from_secs(args.slow_interval.max(1));
+    let flush_every  = Duration::from_secs(args.flush_interval.max(1));
 
     let refresh_kind = RefreshKind::nothing().with_processes(
         ProcessRefreshKind::everything()
@@ -472,10 +548,16 @@ fn main() {
 
     let mut sys = System::new_with_specifics(refresh_kind);
     let mut user_cache = UserCache::new();
-    let mut last_slow = Instant::now()
+    let mut last_slow  = Instant::now()
         .checked_sub(slow_every)
         .unwrap_or_else(Instant::now);
     let mut slow_cache: HashMap<u32, SlowFields> = HashMap::new();
+
+    // Parquet buffer
+    static FLUSH_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut buffer: Vec<ProcRecord> = Vec::new();
+    let mut last_flush     = Instant::now().checked_sub(flush_every).unwrap_or_else(Instant::now);
+    let mut current_hour_str = current_hour();
 
     // For daily retention purge
     let mut last_retention_date = Local::now().format("%Y-%m-%d").to_string();
@@ -500,8 +582,8 @@ fn main() {
             all_pids
         };
 
-        // build records
-        let mut records: Vec<ProcRecord> = Vec::with_capacity(target_pids.len());
+        // Build records and push into buffer
+        let mut tick_count = 0usize;
         for pid in &target_pids {
             let spid = Pid::from_u32(*pid);
             let proc_ = match sys.process(spid) {
@@ -517,67 +599,59 @@ fn main() {
             let slow_ref = slow_cache.get(pid);
             let children = children_map.get(pid).cloned().unwrap_or_default();
             let record = build_record(*pid, proc_, ts, &mut user_cache, &children, slow_ref);
-            records.push(record);
+            buffer.push(record);
+            tick_count += 1;
         }
 
-        // write batch to DuckDB in one transaction
-        let written = records.len();
-        {
-            let tx = conn.transaction().unwrap();
-            {
-                let mut stmt = tx.prepare_cached(
-                    "INSERT INTO proc_metrics VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                ).unwrap();
-                for record in &records {
-                    let children_str = serde_json::to_string(&record.children).unwrap_or_else(|_| "[]".into());
-                    if let Err(e) = stmt.execute(params![
-                        record.ts,
-                        record.pid,
-                        record.ppid,
-                        record.name,
-                        record.user,
-                        record.status,
-                        record.cpu_percent,
-                        record.mem_rss,
-                        record.mem_vms,
-                        record.num_threads,
-                        record.create_time,
-                        record.cwd,
-                        record.num_fds,
-                        children_str,
-                    ]) {
-                        debug!("DuckDB insert error pid={}: {e}", record.pid);
-                    }
-                }
-            }
-            if let Err(e) = tx.commit() {
-                error!("DuckDB commit error: {e}");
-            }
-        }
-
-        // purge stale slow cache entries
+        // Purge stale slow cache entries
         slow_cache.retain(|pid, _| sys.process(Pid::from_u32(*pid)).is_some());
 
-        // daily retention purge
+        // Flush to Parquet if the interval elapsed or the hour changed
+        let new_hour  = current_hour();
+        let hour_changed = new_hour != current_hour_str;
+        let time_to_flush = tick_start.duration_since(last_flush) >= flush_every;
+
+        if (time_to_flush || hour_changed) && !buffer.is_empty() {
+            // Flush records accumulated so far (they belong to current_hour_str)
+            let flush_hour = current_hour_str.clone();
+            let seq = FLUSH_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let filename = format!("{}_{:06}.parquet", flush_hour, seq);
+            let path = data_dir.join(&filename);
+
+            match write_parquet(&path, &buffer) {
+                Ok(()) => {
+                    debug!("flushed {} records -> {}", buffer.len(), filename);
+                }
+                Err(e) => {
+                    error!("Parquet write error {filename}: {e}");
+                }
+            }
+
+            buffer.clear();
+            last_flush = tick_start;
+        }
+
+        if hour_changed {
+            current_hour_str = new_hour;
+        }
+
+        // Daily retention purge of parquet files
         if args.data_retention > 0 {
             let today = Local::now().format("%Y-%m-%d").to_string();
             if today != last_retention_date {
                 last_retention_date = today;
-                let sql = format!("DELETE FROM proc_metrics WHERE ts < extract(epoch FROM current_timestamp)::DOUBLE - {}::DOUBLE", args.data_retention as i64 * 86400);
-                if let Err(e) = conn.execute(&sql, []) {
-                    error!("DuckDB retention purge error: {e}");
-                } else {
-                    info!("DuckDB retention purge: removed rows older than {}d", args.data_retention);
-                }
+                purge_old_files(&data_dir, "parquet", args.data_retention);
+                info!("Parquet retention purge: removed files older than {}d", args.data_retention);
             }
         }
 
         let elapsed = tick_start.elapsed();
         info!(
-            "{} procs | {}ms | slow={}",
-            written,
+            "{} procs | {}ms | slow={} | buffered={}",
+            tick_count,
             elapsed.as_millis(),
-            if do_slow { "yes" } else { "no" }
+            if do_slow { "yes" } else { "no" },
+            buffer.len(),
         );
 
         let elapsed = tick_start.elapsed();

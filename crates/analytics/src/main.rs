@@ -1,4 +1,4 @@
-//! macos-proc-analytics — Axum web dashboard for DuckDB proc metrics.
+//! macos-proc-analytics — Axum web dashboard, reads Parquet files via in-memory DuckDB.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,9 +35,9 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1", env = "ANALYTICS_BIND")]
     bind: String,
 
-    /// Path to procs.duckdb (default: ~/.cache/macos-proc-monitor/data/procs.duckdb)
-    #[arg(long, env = "ANALYTICS_DB")]
-    db: Option<PathBuf>,
+    /// Directory containing .parquet files (default: $MACOS_PROC_MONITOR_FOLDER_DATA or ~/.cache/macos-proc-monitor/data/)
+    #[arg(long, env = "ANALYTICS_DATA_DIR")]
+    data_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ struct Args {
 // ---------------------------------------------------------------------------
 
 struct AppState {
-    db_path: PathBuf,
+    data_dir: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,11 +131,18 @@ impl From<duckdb::Error> for AppError {
 }
 
 // ---------------------------------------------------------------------------
-// Open connection
+// Open in-memory DuckDB and create a view over all parquet files
 // ---------------------------------------------------------------------------
 
-fn open_ro(db_path: &PathBuf) -> Result<Connection, duckdb::Error> {
-    Connection::open(db_path)
+fn open_db(data_dir: &PathBuf) -> Result<Connection, duckdb::Error> {
+    let conn = Connection::open_in_memory()?;
+    // Glob matches all parquet files written by the monitor (YYYY-MM-DDTHH_NNNNNN.parquet)
+    let pattern = data_dir.join("*.parquet").to_string_lossy().to_string();
+    conn.execute_batch(&format!(
+        "CREATE VIEW proc_metrics AS \
+         SELECT * FROM read_parquet('{pattern}', union_by_name=true);",
+    ))?;
+    Ok(conn)
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +170,7 @@ async fn api_summary(
     State(state): State<Arc<AppState>>,
     Query(params): Query<WindowParams>,
 ) -> Result<Json<SummaryResponse>, AppError> {
-    let conn = open_ro(&state.db_path)?;
+    let conn = open_db(&state.data_dir)?;
     let sql = format!(
         "SELECT
             count(DISTINCT pid) as active_procs,
@@ -192,7 +199,7 @@ async fn api_top_cpu(
     State(state): State<Arc<AppState>>,
     Query(params): Query<TopParams>,
 ) -> Result<Json<Vec<TopEntry>>, AppError> {
-    let conn = open_ro(&state.db_path)?;
+    let conn = open_db(&state.data_dir)?;
     let sql = format!(
         "SELECT name, user_name,
                 round(avg(cpu_percent), 2) as avg_cpu,
@@ -223,7 +230,7 @@ async fn api_top_mem(
     State(state): State<Arc<AppState>>,
     Query(params): Query<TopParams>,
 ) -> Result<Json<Vec<TopEntry>>, AppError> {
-    let conn = open_ro(&state.db_path)?;
+    let conn = open_db(&state.data_dir)?;
     let sql = format!(
         "SELECT name, user_name,
                 round(avg(cpu_percent), 2) as avg_cpu,
@@ -254,7 +261,7 @@ async fn api_timeline(
     State(state): State<Arc<AppState>>,
     Query(params): Query<TimelineParams>,
 ) -> Result<Json<Vec<TimelineEntry>>, AppError> {
-    let conn = open_ro(&state.db_path)?;
+    let conn = open_db(&state.data_dir)?;
     let sql = format!(
         "SELECT ts, round(cpu_percent, 2) as cpu_percent, mem_rss
          FROM proc_metrics
@@ -278,7 +285,7 @@ async fn api_processes(
     State(state): State<Arc<AppState>>,
     Query(params): Query<WindowParams>,
 ) -> Result<Json<Vec<ProcessEntry>>, AppError> {
-    let conn = open_ro(&state.db_path)?;
+    let conn = open_db(&state.data_dir)?;
     let sql = format!(
         "SELECT DISTINCT pid, name, user_name, max(ts) as last_seen
          FROM proc_metrics
@@ -313,24 +320,23 @@ async fn main() {
         .with_level(true)
         .init();
 
-    let db_path = args.db.unwrap_or_else(|| {
-        if let Ok(data_dir) = std::env::var("MACOS_PROC_MONITOR_FOLDER_DATA") {
-            PathBuf::from(data_dir).join("procs.duckdb")
+    let data_dir = args.data_dir.unwrap_or_else(|| {
+        if let Ok(d) = std::env::var("MACOS_PROC_MONITOR_FOLDER_DATA") {
+            PathBuf::from(d)
         } else if let Ok(home) = std::env::var("HOME") {
             PathBuf::from(home)
                 .join(".cache")
                 .join("macos-proc-monitor")
                 .join("data")
-                .join("procs.duckdb")
         } else {
-            PathBuf::from("/var/db/macos-proc-monitor/data/procs.duckdb")
+            PathBuf::from("/var/db/macos-proc-monitor/data")
         }
     });
 
-    info!("Using DuckDB at: {}", db_path.display());
+    info!("Data dir: {}", data_dir.display());
     info!("Listening on {}:{}", args.bind, args.port);
 
-    let state = Arc::new(AppState { db_path });
+    let state = Arc::new(AppState { data_dir });
 
     let app = Router::new()
         .route("/", get(index))

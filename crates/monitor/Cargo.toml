@@ -2,7 +2,7 @@
 name = "macos-proc-monitor"
 version = "0.1.0"
 edition = "2021"
-description = "macOS process metrics collector — writes DuckDB per-process per-tick"
+description = "macOS process metrics collector — writes partitioned Parquet files per hour"
 license = "MIT"
 
 [[bin]]
@@ -18,4 +18,5 @@ clap      = { version = "4.6", features = ["derive", "env"] }
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["fmt", "env-filter", "chrono"] }
 uzers     = "0.12"
-duckdb    = { version = "1", features = ["bundled"] }
+arrow     = { version = "53", features = [] }
+parquet   = { version = "53", features = ["arrow"] }
