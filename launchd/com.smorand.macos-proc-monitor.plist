@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Identity -->
+    <key>Label</key>
+    <string>com.smorand.macos-proc-monitor</string>
+
+    <!-- Binary + arguments -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/sbin/macos-proc-monitor</string>
+        <string>--data-retention</string>
+        <string>7</string>
+        <string>--log-retention</string>
+        <string>7</string>
+    </array>
+
+    <!-- Start at boot, restart on crash -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Restart throttle: wait 10s before restarting after a crash -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- stdout/stderr go to the log dir (bootstrap, before the binary opens its own log) -->
+    <key>StandardOutPath</key>
+    <string>/var/log/macos-proc-monitor/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/macos-proc-monitor/stderr.log</string>
+
+    <!-- Run as root so all process metrics are accessible -->
+    <key>UserName</key>
+    <string>root</string>
+
+    <!-- Nice level: low priority, won't compete with foreground work -->
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>
