@@ -17,22 +17,28 @@ build:
 release:
 	cargo build --release
 
-## install: Build release, install to /usr/local/sbin and install sudoers rule (requires sudo)
+## install: Build release, install monitor + analytics + sudoers rule (requires sudo)
 install: release
 	@sudo mkdir -p $(INSTALL_DIR)
 	@sudo cp target/release/$(PROJECT_NAME) $(INSTALL_DIR)/$(PROJECT_NAME)
 	@sudo chown root:wheel $(INSTALL_DIR)/$(PROJECT_NAME)
 	@sudo chmod 755 $(INSTALL_DIR)/$(PROJECT_NAME)
-	@echo "Installed to $(INSTALL_DIR)/$(PROJECT_NAME)"
+	@echo "Installed $(PROJECT_NAME) to $(INSTALL_DIR)/$(PROJECT_NAME)"
 	@sudo cp sudoers.d/$(PROJECT_NAME) /etc/sudoers.d/$(PROJECT_NAME)
 	@sudo chmod 440 /etc/sudoers.d/$(PROJECT_NAME)
 	@echo "Sudoers rule installed: /etc/sudoers.d/$(PROJECT_NAME)"
+	@sudo mkdir -p $(ANALYTICS_INSTALL_DIR)
+	@sudo cp target/release/macos-proc-analytics $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
+	@sudo chown root:wheel $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
+	@sudo chmod 755 $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
+	@echo "Installed macos-proc-analytics to $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics"
 
-## uninstall: Remove binary and sudoers rule (requires sudo)
+## uninstall: Remove binaries and sudoers rule (requires sudo)
 uninstall:
 	@sudo rm -f $(INSTALL_DIR)/$(PROJECT_NAME)
+	@sudo rm -f $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
 	@sudo rm -f /etc/sudoers.d/$(PROJECT_NAME)
-	@echo "Uninstalled $(PROJECT_NAME)"
+	@echo "Uninstalled $(PROJECT_NAME) and macos-proc-analytics"
 
 # ============================================================================
 # DAEMON (launchd)
@@ -105,20 +111,15 @@ analytics-build:
 analytics-release:
 	cargo build --release -p macos-proc-analytics
 
-## analytics-install: Build release and install analytics to /usr/local/bin (requires sudo)
-analytics-install: analytics-release
-	@sudo mkdir -p $(ANALYTICS_INSTALL_DIR)
-	@sudo cp target/release/macos-proc-analytics $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
-	@sudo chown root:wheel $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
-	@sudo chmod 755 $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
-	@echo "Installed to $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics"
+## analytics-install: Alias for install (analytics is included in make install)
+analytics-install: install
 
 ## analytics-run: Run analytics server in dev mode (pass ARGS= for extra flags)
 analytics-run:
 	cargo run -p macos-proc-analytics -- $(ARGS)
 
 ## install-all: Install monitor + analytics + daemon
-install-all: install analytics-install daemon-install
+install-all: install daemon-install
 	@echo "All components installed"
 
 ## help: Show this help
@@ -129,11 +130,13 @@ help:
 	@grep -E '^## ' Makefile | sed 's/## /  /'
 	@echo ""
 	@echo "Examples:"
-	@echo "  make install                                        # build release + install to /usr/local/sbin (sudo)"
-	@echo "  make daemon-install                                # install + register launchd daemon (boot + auto-restart)"
-	@echo "  make daemon-status                                 # check daemon status"
-	@echo "  make daemon-stop                                   # stop daemon (auto-restarts)"
-	@echo "  make daemon-uninstall                              # stop + remove daemon"
-	@echo "  make run ARGS='--help'                             # run with --help"
-	@echo "  make run ARGS='--no-slow --interval 2'             # fast mode, no cwd/fd collection"
-	@echo "  make run ARGS='--out /tmp/p.jsonl --interval 2'    # custom output file"
+	@echo "  make install                    # build + install monitor & analytics (sudo)"
+	@echo "  make daemon-install             # install + register launchd daemon (boot + auto-restart)"
+	@echo "  make install-all               # install + daemon in one shot"
+	@echo "  make uninstall                 # remove all binaries"
+	@echo "  make daemon-status             # check daemon status"
+	@echo "  make daemon-stop               # stop daemon (auto-restarts)"
+	@echo "  make daemon-uninstall          # stop + remove daemon"
+	@echo "  make analytics-run             # run analytics server in dev mode"
+	@echo "  make run ARGS='--help'         # run monitor with --help"
+	@echo "  make run ARGS='--no-slow'      # fast mode, no cwd/fd collection"
