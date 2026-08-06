@@ -1,0 +1,3 @@
+# macos-proc-monitor — allow running without password prompt
+# Installed by: make install
+sebastien ALL=(root) NOPASSWD: /usr/local/sbin/macos-proc-monitor
