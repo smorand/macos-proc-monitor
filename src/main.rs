@@ -54,6 +54,14 @@ struct Args {
     /// Monitor only this PID and its children (omit for all processes)
     #[arg(long)]
     pid: Option<u32>,
+
+    /// Delete data files older than this many days (0 = keep forever)
+    #[arg(long, default_value = "7")]
+    data_retention: u64,
+
+    /// Delete log files older than this many days (0 = keep forever)
+    #[arg(long, default_value = "7")]
+    log_retention: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,10 +246,17 @@ struct RotatingWriter {
     current_date: String,
     writer: BufWriter<File>,
     override_path: Option<PathBuf>,
+    retention_days: u64,
 }
 
 impl RotatingWriter {
-    fn open(dir: PathBuf, prefix: &str, ext: &str, override_path: Option<PathBuf>) -> std::io::Result<Self> {
+    fn open(
+        dir: PathBuf,
+        prefix: &str,
+        ext: &str,
+        override_path: Option<PathBuf>,
+        retention_days: u64,
+    ) -> std::io::Result<Self> {
         let path = if let Some(ref p) = override_path {
             p.clone()
         } else {
@@ -259,10 +274,12 @@ impl RotatingWriter {
             current_date,
             writer: BufWriter::new(file),
             override_path,
+            retention_days,
         })
     }
 
     /// Rotate if date changed (no-op when override_path is set).
+    /// Also purges old files when rotating.
     fn maybe_rotate(&mut self) -> std::io::Result<()> {
         if self.override_path.is_some() {
             return Ok(());
@@ -277,6 +294,10 @@ impl RotatingWriter {
             let file = OpenOptions::new().create(true).append(true).open(&path)?;
             self.writer = BufWriter::new(file);
             self.current_date = today;
+            // purge old files after rotation
+            if self.retention_days > 0 {
+                purge_old_files(&self.dir, &self.ext, self.retention_days);
+            }
         }
         Ok(())
     }
@@ -289,53 +310,124 @@ impl RotatingWriter {
 }
 
 // ---------------------------------------------------------------------------
-// Logging setup: tracing to stderr + file simultaneously
+// Purge files older than retention_days in a directory
 // ---------------------------------------------------------------------------
 
-struct DualWriter {
-    file: std::sync::Mutex<BufWriter<File>>,
-}
+fn purge_old_files(dir: &PathBuf, ext: &str, retention_days: u64) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let cutoff = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(retention_days * 86400);
 
-impl DualWriter {
-    fn new(path: &PathBuf) -> std::io::Result<Self> {
-        if let Some(p) = path.parent() { fs::create_dir_all(p)?; }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { file: std::sync::Mutex::new(BufWriter::new(file)) })
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(u64::MAX);
+        if mtime < cutoff {
+            if let Err(e) = fs::remove_file(&path) {
+                eprintln!("[purge] cannot remove {:?}: {e}", path);
+            } else {
+                eprintln!("[purge] removed {:?}", path);
+            }
+        }
     }
 }
 
-impl std::io::Write for &DualWriter {
+// ---------------------------------------------------------------------------
+// Logging setup: tracing to stderr + rotating file simultaneously
+// ---------------------------------------------------------------------------
+
+struct RotatingLogWriter {
+    dir: PathBuf,
+    current_date: String,
+    file: BufWriter<File>,
+    retention_days: u64,
+}
+
+impl RotatingLogWriter {
+    fn new(log_dir: &PathBuf, retention_days: u64) -> std::io::Result<Self> {
+        fs::create_dir_all(log_dir)?;
+        let current_date = Local::now().format("%Y-%m-%d").to_string();
+        let path = log_dir.join(format!("monitor-{current_date}.log"));
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Self {
+            dir: log_dir.clone(),
+            current_date,
+            file: BufWriter::new(file),
+            retention_days,
+        })
+    }
+
+    fn rotate_if_needed(&mut self) {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        if today == self.current_date {
+            return;
+        }
+        let _ = self.file.flush();
+        let path = self.dir.join(format!("monitor-{today}.log"));
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => {
+                self.file = BufWriter::new(f);
+                self.current_date = today;
+                if self.retention_days > 0 {
+                    purge_old_files(&self.dir, "log", self.retention_days);
+                }
+            }
+            Err(e) => eprintln!("[log rotate] cannot open {path:?}: {e}"),
+        }
+    }
+}
+
+struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<RotatingLogWriter>>);
+
+impl std::io::Write for SharedLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Write to stderr
         let _ = std::io::stderr().write_all(buf);
-        // Write to file
-        if let Ok(mut guard) = self.file.lock() {
-            let _ = guard.write_all(buf);
-            let _ = guard.flush();
+        if let Ok(mut guard) = self.0.lock() {
+            guard.rotate_if_needed();
+            let _ = guard.file.write_all(buf);
+            let _ = guard.file.flush();
         }
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-// tracing needs MakeWriter; we use a static reference trick
-static LOG_WRITER: std::sync::OnceLock<DualWriter> = std::sync::OnceLock::new();
+static LOG_STATE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<RotatingLogWriter>>> =
+    std::sync::OnceLock::new();
 
-struct StaticDualMakeWriter;
+struct StaticLogMakeWriter;
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StaticDualMakeWriter {
-    type Writer = &'a DualWriter;
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StaticLogMakeWriter {
+    type Writer = SharedLogWriter;
     fn make_writer(&'a self) -> Self::Writer {
-        LOG_WRITER.get().expect("LOG_WRITER not initialised")
+        SharedLogWriter(LOG_STATE.get().expect("LOG_STATE not initialised").clone())
     }
 }
 
-fn init_logging(log_path: &PathBuf) {
-    let writer = DualWriter::new(log_path).expect("cannot open log file");
-    LOG_WRITER.set(writer).ok();
+fn init_logging(log_dir: &PathBuf, retention_days: u64) {
+    let rotating = RotatingLogWriter::new(log_dir, retention_days)
+        .expect("cannot open log file");
+    LOG_STATE
+        .set(std::sync::Arc::new(std::sync::Mutex::new(rotating)))
+        .ok();
 
     tracing_subscriber::fmt()
-        .with_writer(StaticDualMakeWriter)
+        .with_writer(StaticLogMakeWriter)
         .with_timer(ChronoLocal::new("[%H:%M:%S]".into()))
         .with_target(false)
         .with_level(true)
@@ -414,7 +506,6 @@ fn main() {
     let log_dir = default_dir("MACOS_PROC_MONITOR_FOLDER_LOG", "logs");
     let data_dir = default_dir("MACOS_PROC_MONITOR_FOLDER_DATA", "data");
 
-    let log_path = args.log.clone().unwrap_or_else(|| dated_path(&log_dir, "monitor", "log"));
     let data_path_override = args.out.clone();
 
     // ensure dirs exist
@@ -425,12 +516,12 @@ fn main() {
         eprintln!("Cannot create data dir {:?}: {e}", data_dir);
     }
 
-    init_logging(&log_path);
+    init_logging(&log_dir, args.log_retention);
 
     info!("macos-proc-monitor starting");
-    info!("log  → {:?}", log_path);
+    info!("log  → {}/monitor-<date>.log", log_dir.display());
     info!(
-        "data → {:?}",
+        "data → {}",
         data_path_override
             .as_deref()
             .map(|p| p.display().to_string())
@@ -439,6 +530,11 @@ fn main() {
     info!(
         "interval={}s  slow-interval={}s  sudo={}  no-slow={}",
         args.interval, args.slow_interval, args.sudo, args.no_slow
+    );
+    info!(
+        "retention: data={}d  logs={}d",
+        if args.data_retention == 0 { "∞".to_string() } else { args.data_retention.to_string() },
+        if args.log_retention == 0 { "∞".to_string() } else { args.log_retention.to_string() },
     );
 
     let interval = Duration::from_secs_f64(args.interval.max(0.1));
@@ -450,6 +546,7 @@ fn main() {
         "procs",
         "jsonl",
         data_path_override,
+        args.data_retention,
     )
     .expect("Cannot open data file");
 
@@ -541,9 +638,6 @@ fn main() {
             if do_slow { "yes" } else { "no" }
         );
 
-        // rotate log path if needed (date changed)
-        // Note: tracing's file handle is fixed; for true log rotation we'd need
-        // more complex plumbing. Data file rotates correctly via RotatingWriter.
         if let Err(e) = data_writer.maybe_rotate() {
             error!("Data rotation error: {e}");
         }
