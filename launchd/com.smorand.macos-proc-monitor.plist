@@ -7,6 +7,15 @@
     <key>Label</key>
     <string>com.smorand.macos-proc-monitor</string>
 
+    <!-- Environment variables: fixed paths shared with macos-proc-analytics -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MACOS_PROC_MONITOR_FOLDER_DATA</key>
+        <string>/var/db/macos-proc-monitor/data</string>
+        <key>MACOS_PROC_MONITOR_FOLDER_LOG</key>
+        <string>/var/db/macos-proc-monitor/logs</string>
+    </dict>
+
     <!-- Binary + arguments -->
     <key>ProgramArguments</key>
     <array>
