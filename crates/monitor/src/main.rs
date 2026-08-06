@@ -209,13 +209,16 @@ fn collect_slow_for_pid(pid: u32, use_sudo: bool) -> SlowFields {
 
 fn default_dir(env_var: &str, subdir: &str) -> PathBuf {
     if let Ok(v) = std::env::var(env_var) {
-        PathBuf::from(v)
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        return PathBuf::from(v);
+    }
+    // Under launchd, HOME may be unset — fall back to /var/db/macos-proc-monitor
+    if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home)
             .join(".cache")
             .join("macos-proc-monitor")
             .join(subdir)
+    } else {
+        PathBuf::from("/var/db/macos-proc-monitor").join(subdir)
     }
 }
 

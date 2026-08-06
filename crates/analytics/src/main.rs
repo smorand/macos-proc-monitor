@@ -314,12 +314,17 @@ async fn main() {
         .init();
 
     let db_path = args.db.unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home)
-            .join(".cache")
-            .join("macos-proc-monitor")
-            .join("data")
-            .join("procs.duckdb")
+        if let Ok(data_dir) = std::env::var("MACOS_PROC_MONITOR_FOLDER_DATA") {
+            PathBuf::from(data_dir).join("procs.duckdb")
+        } else if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home)
+                .join(".cache")
+                .join("macos-proc-monitor")
+                .join("data")
+                .join("procs.duckdb")
+        } else {
+            PathBuf::from("/var/db/macos-proc-monitor/data/procs.duckdb")
+        }
     });
 
     info!("Using DuckDB at: {}", db_path.display());
