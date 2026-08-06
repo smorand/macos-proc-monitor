@@ -1,4 +1,4 @@
-//! macos-proc-monitor — collects per-process metrics every second, writes JSONL.
+//! macos-proc-monitor — collects per-process metrics every second, writes to DuckDB.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 use clap::Parser;
+use duckdb::{params, Connection};
 use serde::Serialize;
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 use tracing::{debug, error, info};
@@ -22,19 +23,11 @@ use uzers::get_user_by_uid;
 #[derive(Parser, Debug)]
 #[command(
     name = "macos-proc-monitor",
-    about = "Collect per-process metrics every second, write JSONL",
+    about = "Collect per-process metrics every second, write to DuckDB",
     long_about = None,
     version
 )]
 struct Args {
-    /// Data output file (default: ~/.cache/macos-proc-monitor/data/procs-YYYY-MM-DD.jsonl)
-    #[arg(long)]
-    out: Option<PathBuf>,
-
-    /// Log file (default: ~/.cache/macos-proc-monitor/logs/monitor-YYYY-MM-DD.log)
-    #[arg(long)]
-    log: Option<PathBuf>,
-
     /// Sampling interval in seconds
     #[arg(long, default_value = "1.0")]
     interval: f64,
@@ -55,7 +48,7 @@ struct Args {
     #[arg(long)]
     pid: Option<u32>,
 
-    /// Delete data files older than this many days (0 = keep forever)
+    /// Delete data rows older than this many days (0 = keep forever)
     #[arg(long, default_value = "7")]
     data_retention: u64,
 
@@ -65,7 +58,7 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-// JSONL record
+// Record struct (used for building, not serialized to JSON for writing)
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -140,8 +133,6 @@ fn lsof_cwd(pid: u32, use_sudo: bool) -> Option<String> {
     if !out.status.success() && out.stdout.is_empty() {
         return None;
     }
-    // Output lines: p<pid>\nn<path>
-    // We want the line starting with 'n'
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         if let Some(path) = line.strip_prefix('n') {
@@ -172,12 +163,10 @@ fn lsof_num_fds(pid: u32, use_sudo: bool) -> Option<u32> {
     if !out.status.success() && out.stdout.is_empty() {
         return None;
     }
-    // Count non-empty lines (first line is header)
     let count = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| !l.is_empty())
         .count();
-    // Subtract 1 for header row; if 0 lines, return None
     if count == 0 {
         None
     } else {
@@ -186,7 +175,7 @@ fn lsof_num_fds(pid: u32, use_sudo: bool) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: build child PID map from process list
+// Helpers: build child PID map
 // ---------------------------------------------------------------------------
 
 fn build_children_map(sys: &System) -> HashMap<u32, Vec<u32>> {
@@ -200,7 +189,7 @@ fn build_children_map(sys: &System) -> HashMap<u32, Vec<u32>> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: collect slow fields (cwd + num_fds) for all pids
+// Helpers: slow fields (cwd + num_fds)
 // ---------------------------------------------------------------------------
 
 struct SlowFields {
@@ -215,7 +204,7 @@ fn collect_slow_for_pid(pid: u32, use_sudo: bool) -> SlowFields {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: log + data file paths (date-rotated)
+// Helpers: directory resolution
 // ---------------------------------------------------------------------------
 
 fn default_dir(env_var: &str, subdir: &str) -> PathBuf {
@@ -230,87 +219,8 @@ fn default_dir(env_var: &str, subdir: &str) -> PathBuf {
     }
 }
 
-fn dated_path(dir: &PathBuf, prefix: &str, ext: &str) -> PathBuf {
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    dir.join(format!("{prefix}-{today}.{ext}"))
-}
-
 // ---------------------------------------------------------------------------
-// File writer with date rotation
-// ---------------------------------------------------------------------------
-
-struct RotatingWriter {
-    dir: PathBuf,
-    prefix: String,
-    ext: String,
-    current_date: String,
-    writer: BufWriter<File>,
-    override_path: Option<PathBuf>,
-    retention_days: u64,
-}
-
-impl RotatingWriter {
-    fn open(
-        dir: PathBuf,
-        prefix: &str,
-        ext: &str,
-        override_path: Option<PathBuf>,
-        retention_days: u64,
-    ) -> std::io::Result<Self> {
-        let path = if let Some(ref p) = override_path {
-            p.clone()
-        } else {
-            dated_path(&dir, prefix, ext)
-        };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let current_date = Local::now().format("%Y-%m-%d").to_string();
-        Ok(Self {
-            dir,
-            prefix: prefix.to_string(),
-            ext: ext.to_string(),
-            current_date,
-            writer: BufWriter::new(file),
-            override_path,
-            retention_days,
-        })
-    }
-
-    /// Rotate if date changed (no-op when override_path is set).
-    /// Also purges old files when rotating.
-    fn maybe_rotate(&mut self) -> std::io::Result<()> {
-        if self.override_path.is_some() {
-            return Ok(());
-        }
-        let today = Local::now().format("%Y-%m-%d").to_string();
-        if today != self.current_date {
-            let _ = self.writer.flush();
-            let path = dated_path(&self.dir, &self.prefix, &self.ext);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let file = OpenOptions::new().create(true).append(true).open(&path)?;
-            self.writer = BufWriter::new(file);
-            self.current_date = today;
-            // purge old files after rotation
-            if self.retention_days > 0 {
-                purge_old_files(&self.dir, &self.ext, self.retention_days);
-            }
-        }
-        Ok(())
-    }
-
-    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-        self.maybe_rotate()?;
-        writeln!(self.writer, "{}", line)?;
-        self.writer.flush()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Purge files older than retention_days in a directory
+// Purge log files older than retention_days
 // ---------------------------------------------------------------------------
 
 fn purge_old_files(dir: &PathBuf, ext: &str, retention_days: u64) {
@@ -348,7 +258,7 @@ fn purge_old_files(dir: &PathBuf, ext: &str, retention_days: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Logging setup: tracing to stderr + rotating file simultaneously
+// Rotating log writer
 // ---------------------------------------------------------------------------
 
 struct RotatingLogWriter {
@@ -436,7 +346,7 @@ fn init_logging(log_dir: &PathBuf, retention_days: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Build a ProcRecord from sysinfo data + optional slow fields
+// Build a ProcRecord from sysinfo data
 // ---------------------------------------------------------------------------
 
 fn build_record(
@@ -448,12 +358,9 @@ fn build_record(
     slow: Option<&SlowFields>,
 ) -> ProcRecord {
     let ppid = proc_.parent().map(|p| p.as_u32());
-
     let uid = proc_.user_id().map(|u| **u);
     let user = uid.and_then(|u| user_cache.lookup(u));
-
     let status = format!("{:?}", proc_.status()).to_lowercase();
-
     let (cwd, num_fds) = match slow {
         Some(s) => (s.cwd.clone(), s.num_fds),
         None => (None, None),
@@ -502,13 +409,9 @@ fn reachable_pids(root: u32, children_map: &HashMap<u32, Vec<u32>>) -> Vec<u32> 
 fn main() {
     let args = Args::parse();
 
-    // --- resolve paths ---
     let log_dir = default_dir("MACOS_PROC_MONITOR_FOLDER_LOG", "logs");
     let data_dir = default_dir("MACOS_PROC_MONITOR_FOLDER_DATA", "data");
 
-    let data_path_override = args.out.clone();
-
-    // ensure dirs exist
     if let Err(e) = fs::create_dir_all(&log_dir) {
         eprintln!("Cannot create log dir {:?}: {e}", log_dir);
     }
@@ -518,39 +421,45 @@ fn main() {
 
     init_logging(&log_dir, args.log_retention);
 
+    // --- open DuckDB ---
+    let db_path = data_dir.join("procs.duckdb");
+    let mut conn = Connection::open(&db_path).expect("cannot open DuckDB");
+
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS proc_metrics (
+            ts           DOUBLE NOT NULL,
+            pid          UINTEGER NOT NULL,
+            ppid         UINTEGER,
+            name         VARCHAR,
+            user_name    VARCHAR,
+            status       VARCHAR,
+            cpu_percent  FLOAT,
+            mem_rss      UBIGINT,
+            mem_vms      UBIGINT,
+            num_threads  UBIGINT,
+            create_time  DOUBLE,
+            cwd          VARCHAR,
+            num_fds      UINTEGER,
+            children     VARCHAR
+        );
+    ").expect("cannot create table");
+
     info!("macos-proc-monitor starting");
-    info!("log  → {}/monitor-<date>.log", log_dir.display());
-    info!(
-        "data → {}",
-        data_path_override
-            .as_deref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| format!("{}/procs-<date>.jsonl", data_dir.display()))
-    );
+    info!("log  -> {}/monitor-<date>.log", log_dir.display());
+    info!("data -> {}", db_path.display());
     info!(
         "interval={}s  slow-interval={}s  sudo={}  no-slow={}",
         args.interval, args.slow_interval, args.sudo, args.no_slow
     );
     info!(
         "retention: data={}d  logs={}d",
-        if args.data_retention == 0 { "∞".to_string() } else { args.data_retention.to_string() },
-        if args.log_retention == 0 { "∞".to_string() } else { args.log_retention.to_string() },
+        if args.data_retention == 0 { "inf".to_string() } else { args.data_retention.to_string() },
+        if args.log_retention == 0 { "inf".to_string() } else { args.log_retention.to_string() },
     );
 
     let interval = Duration::from_secs_f64(args.interval.max(0.1));
     let slow_every = Duration::from_secs(args.slow_interval.max(1));
 
-    // --- open data writer ---
-    let mut data_writer = RotatingWriter::open(
-        data_dir.clone(),
-        "procs",
-        "jsonl",
-        data_path_override,
-        args.data_retention,
-    )
-    .expect("Cannot open data file");
-
-    // --- sysinfo ---
     let refresh_kind = RefreshKind::nothing().with_processes(
         ProcessRefreshKind::everything()
             .with_cpu()
@@ -559,31 +468,28 @@ fn main() {
     );
 
     let mut sys = System::new_with_specifics(refresh_kind);
-
     let mut user_cache = UserCache::new();
     let mut last_slow = Instant::now()
         .checked_sub(slow_every)
-        .unwrap_or_else(Instant::now); // trigger immediately on first tick
-
-    // Slow-field cache: pid → SlowFields (reused across ticks)
+        .unwrap_or_else(Instant::now);
     let mut slow_cache: HashMap<u32, SlowFields> = HashMap::new();
+
+    // For daily retention purge
+    let mut last_retention_date = Local::now().format("%Y-%m-%d").to_string();
 
     loop {
         let tick_start = Instant::now();
         let ts = unix_now();
 
-        // refresh processes
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::everything());
 
         let children_map = build_children_map(&sys);
 
-        // should we do a slow collection this tick?
         let do_slow = !args.no_slow && tick_start.duration_since(last_slow) >= slow_every;
         if do_slow {
             last_slow = tick_start;
         }
 
-        // determine which pids to emit
         let all_pids: Vec<u32> = sys.processes().keys().map(|p| p.as_u32()).collect();
         let target_pids: Vec<u32> = if let Some(root) = args.pid {
             reachable_pids(root, &children_map)
@@ -591,8 +497,8 @@ fn main() {
             all_pids
         };
 
-        let mut written = 0usize;
-
+        // build records
+        let mut records: Vec<ProcRecord> = Vec::with_capacity(target_pids.len());
         for pid in &target_pids {
             let spid = Pid::from_u32(*pid);
             let proc_ = match sys.process(spid) {
@@ -600,35 +506,68 @@ fn main() {
                 None => continue,
             };
 
-            // slow collection
             if do_slow {
                 let slow_fields = collect_slow_for_pid(*pid, args.sudo);
                 slow_cache.insert(*pid, slow_fields);
             }
 
-            // purge pids that no longer exist from cache (keep memory tidy)
-            // (done below after the loop)
-
             let slow_ref = slow_cache.get(pid);
             let children = children_map.get(pid).cloned().unwrap_or_default();
-
             let record = build_record(*pid, proc_, ts, &mut user_cache, &children, slow_ref);
+            records.push(record);
+        }
 
-            match serde_json::to_string(&record) {
-                Ok(line) => {
-                    if let Err(e) = data_writer.write_line(&line) {
-                        error!("Write error: {e}");
+        // write batch to DuckDB in one transaction
+        let written = records.len();
+        {
+            let tx = conn.transaction().unwrap();
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT INTO proc_metrics VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                ).unwrap();
+                for record in &records {
+                    let children_str = serde_json::to_string(&record.children).unwrap_or_else(|_| "[]".into());
+                    if let Err(e) = stmt.execute(params![
+                        record.ts,
+                        record.pid,
+                        record.ppid,
+                        record.name,
+                        record.user,
+                        record.status,
+                        record.cpu_percent,
+                        record.mem_rss,
+                        record.mem_vms,
+                        record.num_threads,
+                        record.create_time,
+                        record.cwd,
+                        record.num_fds,
+                        children_str,
+                    ]) {
+                        debug!("DuckDB insert error pid={}: {e}", record.pid);
                     }
-                    written += 1;
                 }
-                Err(e) => {
-                    debug!("Serialise pid={pid} error: {e}");
-                }
+            }
+            if let Err(e) = tx.commit() {
+                error!("DuckDB commit error: {e}");
             }
         }
 
         // purge stale slow cache entries
         slow_cache.retain(|pid, _| sys.process(Pid::from_u32(*pid)).is_some());
+
+        // daily retention purge
+        if args.data_retention > 0 {
+            let today = Local::now().format("%Y-%m-%d").to_string();
+            if today != last_retention_date {
+                last_retention_date = today;
+                let sql = format!("DELETE FROM proc_metrics WHERE ts < extract(epoch FROM current_timestamp)::DOUBLE - {}::DOUBLE", args.data_retention as i64 * 86400);
+                if let Err(e) = conn.execute(&sql, []) {
+                    error!("DuckDB retention purge error: {e}");
+                } else {
+                    info!("DuckDB retention purge: removed rows older than {}d", args.data_retention);
+                }
+            }
+        }
 
         let elapsed = tick_start.elapsed();
         info!(
@@ -638,11 +577,6 @@ fn main() {
             if do_slow { "yes" } else { "no" }
         );
 
-        if let Err(e) = data_writer.maybe_rotate() {
-            error!("Data rotation error: {e}");
-        }
-
-        // sleep for remainder of interval
         let elapsed = tick_start.elapsed();
         if elapsed < interval {
             std::thread::sleep(interval - elapsed);

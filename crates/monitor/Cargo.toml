@@ -1,0 +1,21 @@
+[package]
+name = "macos-proc-monitor"
+version = "0.1.0"
+edition = "2021"
+description = "macOS process metrics collector — writes DuckDB per-process per-tick"
+license = "MIT"
+
+[[bin]]
+name = "macos-proc-monitor"
+path = "src/main.rs"
+
+[dependencies]
+sysinfo   = "0.39"
+serde     = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono    = { version = "0.4", features = ["serde"] }
+clap      = { version = "4.6", features = ["derive", "env"] }
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["fmt", "env-filter", "chrono"] }
+uzers     = "0.12"
+duckdb    = { version = "1", features = ["bundled"] }

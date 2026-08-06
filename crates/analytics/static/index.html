@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>macOS Process Analytics</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #1a1a2e;
+    --card: #16213e;
+    --accent: #0f3460;
+    --highlight: #e94560;
+    --text: #e0e0e0;
+    --muted: #888;
+    --border: #2a2a4e;
+    --active-btn: #e94560;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 14px;
+    min-height: 100vh;
+  }
+
+  header {
+    background: var(--accent);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+  }
+
+  header h1 {
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+
+  header .meta {
+    font-size: 12px;
+    color: #aac;
+    text-align: right;
+  }
+
+  .window-bar {
+    background: var(--card);
+    padding: 10px 24px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+
+  .window-bar span {
+    font-size: 12px;
+    color: var(--muted);
+    margin-right: 4px;
+  }
+
+  .window-btn {
+    background: var(--accent);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: background 0.15s;
+  }
+
+  .window-btn:hover { background: #1a4a80; }
+  .window-btn.active { background: var(--active-btn); border-color: var(--active-btn); }
+
+  .refresh-info {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  main {
+    padding: 20px 24px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  .summary-bar {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+
+  .summary-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 20px;
+    flex: 1;
+    min-width: 150px;
+  }
+
+  .summary-card .label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 6px;
+  }
+
+  .summary-card .value {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--highlight);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 20px;
+  }
+
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+
+  .card h2 {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 14px;
+    color: #ccd;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+  }
+
+  .chart-wrap {
+    height: 200px;
+    margin-bottom: 14px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  th {
+    text-align: left;
+    color: var(--muted);
+    font-weight: 500;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--border);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+  }
+
+  td {
+    padding: 5px 6px;
+    border-bottom: 1px solid #1e1e3e;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+  }
+
+  tr:hover td { background: rgba(255,255,255,0.03); }
+
+  .timeline-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 20px;
+  }
+
+  .timeline-card h2 {
+    font-size: 14px;
+    font-weight: 600;
+    color: #ccd;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin-bottom: 12px;
+  }
+
+  .timeline-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+  }
+
+  .timeline-controls label {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  select {
+    background: var(--accent);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 5px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    min-width: 200px;
+  }
+
+  .timeline-chart-wrap { height: 220px; }
+
+  footer {
+    background: var(--card);
+    border-top: 1px solid var(--border);
+    padding: 12px 24px;
+    font-size: 11px;
+    color: var(--muted);
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .cpu-bar {
+    display: inline-block;
+    background: var(--highlight);
+    height: 6px;
+    border-radius: 3px;
+    vertical-align: middle;
+    margin-right: 4px;
+  }
+
+  .mem-bar {
+    display: inline-block;
+    background: #2a9d8f;
+    height: 6px;
+    border-radius: 3px;
+    vertical-align: middle;
+    margin-right: 4px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>macOS Process Analytics</h1>
+  <div class="meta">
+    <div id="last-updated">Loading...</div>
+  </div>
+</header>
+
+<div class="window-bar">
+  <span>Window:</span>
+  <button class="window-btn" data-window="60">1m</button>
+  <button class="window-btn active" data-window="300">5m</button>
+  <button class="window-btn" data-window="900">15m</button>
+  <button class="window-btn" data-window="3600">1h</button>
+  <button class="window-btn" data-window="21600">6h</button>
+  <div class="refresh-info">Auto-refresh in <span id="countdown">5</span>s</div>
+</div>
+
+<main>
+  <div class="summary-bar">
+    <div class="summary-card">
+      <div class="label">Active Processes</div>
+      <div class="value" id="sum-procs">--</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Total CPU %</div>
+      <div class="value" id="sum-cpu">--</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Total RAM (RSS)</div>
+      <div class="value" id="sum-ram">--</div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Top CPU</h2>
+      <div class="chart-wrap">
+        <canvas id="chart-cpu"></canvas>
+      </div>
+      <table id="table-cpu">
+        <thead><tr><th>Process</th><th>User</th><th>Avg CPU%</th><th>Peak RAM</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Top RAM</h2>
+      <div class="chart-wrap">
+        <canvas id="chart-mem"></canvas>
+      </div>
+      <table id="table-mem">
+        <thead><tr><th>Process</th><th>User</th><th>Avg CPU%</th><th>Peak RAM</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="timeline-card">
+    <h2>Process Timeline</h2>
+    <div class="timeline-controls">
+      <label for="proc-select">Process (PID):</label>
+      <select id="proc-select"><option value="">-- select a process --</option></select>
+    </div>
+    <div class="timeline-chart-wrap">
+      <canvas id="chart-timeline"></canvas>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <span id="footer-db">DB: ~/.cache/macos-proc-monitor/data/procs.duckdb</span>
+  <span id="footer-procs"></span>
+  <span id="footer-cpu"></span>
+  <span id="footer-ram"></span>
+</footer>
+
+<script>
+  let currentWindow = 300;
+  let countdown = 5;
+  let refreshTimer = null;
+  let countdownTimer = null;
+
+  let chartCpu = null;
+  let chartMem = null;
+  let chartTimeline = null;
+
+  const BASE_URL = '';
+
+  // --- Utilities ---
+
+  function fmtBytes(bytes) {
+    if (!bytes) return '0 B';
+    if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+    if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return bytes + ' B';
+  }
+
+  function fmtCpu(v) {
+    return (v || 0).toFixed(1) + '%';
+  }
+
+  function fmtTs(ts) {
+    return new Date(ts * 1000).toLocaleTimeString();
+  }
+
+  // --- Chart helpers ---
+
+  const chartDefaults = {
+    indexAxis: 'y',
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { display: false }, tooltip: { callbacks: {} } },
+    scales: {
+      x: {
+        grid: { color: '#2a2a4e' },
+        ticks: { color: '#888', font: { size: 10 } }
+      },
+      y: {
+        grid: { color: '#2a2a4e' },
+        ticks: { color: '#ccc', font: { size: 11 } }
+      }
+    }
+  };
+
+  function makeBarChart(canvasId, color, tooltipFmt) {
+    const ctx = document.getElementById(canvasId).getContext('2d');
+    return new Chart(ctx, {
+      type: 'bar',
+      data: { labels: [], datasets: [{ data: [], backgroundColor: color, borderRadius: 3 }] },
+      options: {
+        ...chartDefaults,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => tooltipFmt(ctx.raw)
+            }
+          }
+        }
+      }
+    });
+  }
+
+  function updateBarChart(chart, labels, data) {
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = data;
+    chart.update('none');
+  }
+
+  // --- Summary ---
+
+  async function loadSummary() {
+    const r = await fetch(`${BASE_URL}/api/summary?window=${currentWindow}`);
+    const d = await r.json();
+    document.getElementById('sum-procs').textContent = d.active_procs ?? '--';
+    document.getElementById('sum-cpu').textContent = fmtCpu(d.total_cpu);
+    document.getElementById('sum-ram').textContent = fmtBytes(d.total_rss);
+    document.getElementById('footer-procs').textContent = `Active: ${d.active_procs} procs`;
+    document.getElementById('footer-cpu').textContent = `CPU: ${fmtCpu(d.total_cpu)}`;
+    document.getElementById('footer-ram').textContent = `RAM: ${fmtBytes(d.total_rss)}`;
+  }
+
+  // --- Top CPU ---
+
+  async function loadTopCpu() {
+    const r = await fetch(`${BASE_URL}/api/top?window=${currentWindow}&limit=10`);
+    const data = await r.json();
+
+    updateBarChart(
+      chartCpu,
+      data.map(d => d.name),
+      data.map(d => d.avg_cpu)
+    );
+
+    const tbody = document.querySelector('#table-cpu tbody');
+    tbody.innerHTML = data.map(d =>
+      `<tr>
+        <td title="${d.name}">${d.name}</td>
+        <td>${d.user || ''}</td>
+        <td><span class="cpu-bar" style="width:${Math.min(d.avg_cpu*2,60)}px"></span>${fmtCpu(d.avg_cpu)}</td>
+        <td>${fmtBytes(d.peak_rss)}</td>
+      </tr>`
+    ).join('');
+  }
+
+  // --- Top RAM ---
+
+  async function loadTopMem() {
+    const r = await fetch(`${BASE_URL}/api/top-mem?window=${currentWindow}&limit=10`);
+    const data = await r.json();
+
+    updateBarChart(
+      chartMem,
+      data.map(d => d.name),
+      data.map(d => d.peak_rss / (1024 * 1024))
+    );
+
+    const tbody = document.querySelector('#table-mem tbody');
+    tbody.innerHTML = data.map(d =>
+      `<tr>
+        <td title="${d.name}">${d.name}</td>
+        <td>${d.user || ''}</td>
+        <td>${fmtCpu(d.avg_cpu)}</td>
+        <td><span class="mem-bar" style="width:${Math.min(d.peak_rss/(1024*1024*1024)*60,60)}px"></span>${fmtBytes(d.peak_rss)}</td>
+      </tr>`
+    ).join('');
+  }
+
+  // --- Processes dropdown ---
+
+  async function loadProcesses() {
+    const r = await fetch(`${BASE_URL}/api/processes?window=${currentWindow}`);
+    const data = await r.json();
+    const sel = document.getElementById('proc-select');
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">-- select a process --</option>' +
+      data.map(d => `<option value="${d.pid}">${d.name} (${d.pid})</option>`).join('');
+    if (prev) sel.value = prev;
+    if (sel.value) loadTimeline(parseInt(sel.value));
+  }
+
+  // --- Timeline ---
+
+  async function loadTimeline(pid) {
+    if (!pid) return;
+    const r = await fetch(`${BASE_URL}/api/timeline?pid=${pid}&window=${currentWindow}`);
+    const data = await r.json();
+
+    const labels = data.map(d => fmtTs(d.ts));
+    const cpuData = data.map(d => d.cpu_percent);
+    const memData = data.map(d => d.mem_rss / (1024 * 1024));
+
+    if (!chartTimeline) {
+      const ctx = document.getElementById('chart-timeline').getContext('2d');
+      chartTimeline = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: 'CPU%',
+              data: cpuData,
+              borderColor: '#e94560',
+              backgroundColor: 'rgba(233,69,96,0.1)',
+              yAxisID: 'yCpu',
+              tension: 0.3,
+              pointRadius: 0,
+              borderWidth: 1.5,
+              fill: true
+            },
+            {
+              label: 'RAM (MB)',
+              data: memData,
+              borderColor: '#2a9d8f',
+              backgroundColor: 'rgba(42,157,143,0.1)',
+              yAxisID: 'yMem',
+              tension: 0.3,
+              pointRadius: 0,
+              borderWidth: 1.5,
+              fill: true
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: {
+              display: true,
+              labels: { color: '#ccc', font: { size: 11 } }
+            }
+          },
+          scales: {
+            x: {
+              grid: { color: '#2a2a4e' },
+              ticks: { color: '#888', font: { size: 9 }, maxTicksLimit: 10, maxRotation: 0 }
+            },
+            yCpu: {
+              type: 'linear',
+              position: 'left',
+              grid: { color: '#2a2a4e' },
+              ticks: { color: '#e94560', font: { size: 10 }, callback: v => v + '%' }
+            },
+            yMem: {
+              type: 'linear',
+              position: 'right',
+              grid: { drawOnChartArea: false },
+              ticks: { color: '#2a9d8f', font: { size: 10 }, callback: v => v.toFixed(0) + ' MB' }
+            }
+          }
+        }
+      });
+    } else {
+      chartTimeline.data.labels = labels;
+      chartTimeline.data.datasets[0].data = cpuData;
+      chartTimeline.data.datasets[1].data = memData;
+      chartTimeline.update('none');
+    }
+  }
+
+  // --- Refresh cycle ---
+
+  async function refresh() {
+    try {
+      await Promise.all([loadSummary(), loadTopCpu(), loadTopMem(), loadProcesses()]);
+      document.getElementById('last-updated').textContent =
+        'Updated: ' + new Date().toLocaleTimeString();
+    } catch(e) {
+      document.getElementById('last-updated').textContent = 'Error: ' + e.message;
+    }
+    resetCountdown();
+  }
+
+  function resetCountdown() {
+    countdown = 5;
+    document.getElementById('countdown').textContent = countdown;
+    clearInterval(countdownTimer);
+    countdownTimer = setInterval(() => {
+      countdown--;
+      document.getElementById('countdown').textContent = countdown;
+      if (countdown <= 0) {
+        clearInterval(countdownTimer);
+        refresh();
+      }
+    }, 1000);
+  }
+
+  // --- Init ---
+
+  document.querySelectorAll('.window-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.window-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentWindow = parseInt(btn.dataset.window);
+      // Reset timeline chart so it recreates with new window
+      if (chartTimeline) { chartTimeline.destroy(); chartTimeline = null; }
+      refresh();
+    });
+  });
+
+  document.getElementById('proc-select').addEventListener('change', e => {
+    const pid = parseInt(e.target.value);
+    if (chartTimeline) { chartTimeline.destroy(); chartTimeline = null; }
+    if (pid) loadTimeline(pid);
+  });
+
+  // Init charts
+  chartCpu = makeBarChart('chart-cpu', '#e94560', v => fmtCpu(v));
+  chartMem = makeBarChart('chart-mem', '#2a9d8f', v => v.toFixed(1) + ' MB');
+
+  refresh();
+</script>
+</body>
+</html>

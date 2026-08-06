@@ -1,5 +1,6 @@
 .PHONY: build release install uninstall run clean clean-all info help test \
-        daemon-install daemon-uninstall daemon-start daemon-stop daemon-status
+        daemon-install daemon-uninstall daemon-start daemon-stop daemon-status \
+        analytics-build analytics-release analytics-install analytics-run install-all
 
 PROJECT_NAME  = macos-proc-monitor
 INSTALL_DIR   = /usr/local/sbin
@@ -8,11 +9,11 @@ LAUNCH_PLIST  = /Library/LaunchDaemons/$(LAUNCH_LABEL).plist
 LOG_DIR       = /var/log/macos-proc-monitor
 VERSION       = $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
-## build: Build debug binary
+## build: Build debug binary (all workspace members)
 build:
 	cargo build
 
-## release: Build optimized release binary
+## release: Build optimized release binary (all workspace members)
 release:
 	cargo build --release
 
@@ -67,9 +68,9 @@ daemon-stop:
 daemon-status:
 	@sudo launchctl list | grep $(LAUNCH_LABEL) || echo "$(LAUNCH_LABEL) not running"
 
-## run: Run in debug mode (pass extra flags via ARGS=)
+## run: Run monitor in debug mode (pass extra flags via ARGS=)
 run:
-	cargo run -- $(ARGS)
+	cargo run -p macos-proc-monitor -- $(ARGS)
 
 ## test: Run tests
 test:
@@ -89,6 +90,36 @@ info:
 	@echo "Binary:   $(INSTALL_DIR)/$(PROJECT_NAME)"
 	@echo "Daemon:   $(LAUNCH_PLIST)"
 	@echo "Logs:     $(LOG_DIR)/"
+
+# ============================================================================
+# ANALYTICS
+# ============================================================================
+
+ANALYTICS_INSTALL_DIR = /usr/local/bin
+
+## analytics-build: Build debug analytics binary
+analytics-build:
+	cargo build -p macos-proc-analytics
+
+## analytics-release: Build release analytics binary
+analytics-release:
+	cargo build --release -p macos-proc-analytics
+
+## analytics-install: Build release and install analytics to /usr/local/bin (requires sudo)
+analytics-install: analytics-release
+	@sudo mkdir -p $(ANALYTICS_INSTALL_DIR)
+	@sudo cp target/release/macos-proc-analytics $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
+	@sudo chown root:wheel $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
+	@sudo chmod 755 $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
+	@echo "Installed to $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics"
+
+## analytics-run: Run analytics server in dev mode (pass ARGS= for extra flags)
+analytics-run:
+	cargo run -p macos-proc-analytics -- $(ARGS)
+
+## install-all: Install monitor + analytics + daemon
+install-all: install analytics-install daemon-install
+	@echo "All components installed"
 
 ## help: Show this help
 help:
