@@ -1,0 +1,18 @@
+# Rust/Cargo
+/target/
+*.pdb
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env files
+.env
+.env.*
+
+# Generated data / logs (don't commit monitoring output)
+*.jsonl
+*.log
