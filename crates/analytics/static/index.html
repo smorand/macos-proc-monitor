@@ -728,6 +728,11 @@
   chartCpu = makeBarChart('chart-cpu', '#e94560', v => fmtCpu(v));
   chartMem = makeBarChart('chart-mem', '#2a9d8f', v => v.toFixed(1) + ' MB');
 
+  // Resize all charts on zoom or layout change (Chart.js misses browser zoom events)
+  new ResizeObserver(() => {
+    [chartCpu, chartMem, chartTimeline].forEach(c => c && c.resize());
+  }).observe(document.body);
+
   refresh();
 </script>
 </body>
