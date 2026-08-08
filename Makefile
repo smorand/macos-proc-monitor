@@ -1,5 +1,5 @@
 .PHONY: build release install uninstall run clean clean-all info help test \
-        daemon-install daemon-uninstall daemon-start daemon-stop daemon-status
+        daemon-start daemon-stop daemon-status
 
 PROJECT_NAME  = macos-proc-monitor
 INSTALL_DIR   = /usr/local/sbin
@@ -16,7 +16,8 @@ build:
 release:
 	cargo build --release
 
-## install: Build release, install the daemon binary + sudoers rule (requires sudo)
+## install: Build release, install binary + sudoers, register & load the launchd daemon (requires sudo)
+## Collects metrics to /var/db/macos-proc-monitor/data/ and serves the dashboard on http://127.0.0.1:9090
 install: release
 	@sudo mkdir -p $(INSTALL_DIR)
 	@sudo cp target/release/$(PROJECT_NAME) $(INSTALL_DIR)/$(PROJECT_NAME)
@@ -26,20 +27,6 @@ install: release
 	@sudo cp sudoers.d/$(PROJECT_NAME) /etc/sudoers.d/$(PROJECT_NAME)
 	@sudo chmod 440 /etc/sudoers.d/$(PROJECT_NAME)
 	@echo "Sudoers rule installed: /etc/sudoers.d/$(PROJECT_NAME)"
-
-## uninstall: Remove binary and sudoers rule (requires sudo)
-uninstall:
-	@sudo rm -f $(INSTALL_DIR)/$(PROJECT_NAME)
-	@sudo rm -f /etc/sudoers.d/$(PROJECT_NAME)
-	@echo "Uninstalled $(PROJECT_NAME)"
-
-# ============================================================================
-# DAEMON (launchd)
-# ============================================================================
-
-## daemon-install: Install and load the launchd daemon (requires sudo)
-## Collects metrics to /var/db/macos-proc-monitor/data/ and serves the dashboard on http://127.0.0.1:9090
-daemon-install: install
 	@sudo mkdir -p $(LOG_DIR)
 	@sudo mkdir -p /var/db/macos-proc-monitor/data
 	@sudo mkdir -p /var/db/macos-proc-monitor/logs
@@ -52,11 +39,17 @@ daemon-install: install
 	@echo "Dashboard: http://127.0.0.1:9090"
 	@echo "Logs: $(LOG_DIR)/"
 
-## daemon-uninstall: Unload and remove the launchd daemon (requires sudo)
-daemon-uninstall:
+## uninstall: Unload the daemon, remove binary + sudoers rule (requires sudo)
+uninstall:
 	@sudo launchctl unload -w $(LAUNCH_PLIST) 2>/dev/null || true
 	@sudo rm -f $(LAUNCH_PLIST)
-	@echo "Daemon removed: $(LAUNCH_LABEL)"
+	@sudo rm -f $(INSTALL_DIR)/$(PROJECT_NAME)
+	@sudo rm -f /etc/sudoers.d/$(PROJECT_NAME)
+	@echo "Uninstalled $(PROJECT_NAME) (daemon unloaded, binary + sudoers removed)"
+
+# ============================================================================
+# DAEMON (launchd)
+# ============================================================================
 
 ## daemon-start: Start the daemon manually
 daemon-start:
@@ -66,7 +59,7 @@ daemon-start:
 ## daemon-stop: Stop the daemon (will restart automatically via KeepAlive)
 daemon-stop:
 	@sudo launchctl stop $(LAUNCH_LABEL)
-	@echo "Stopped $(LAUNCH_LABEL) (will auto-restart — use daemon-uninstall to disable)"
+	@echo "Stopped $(LAUNCH_LABEL) (will auto-restart — use make uninstall to remove)"
 
 ## daemon-status: Show daemon status
 daemon-status:
@@ -85,7 +78,7 @@ clean:
 	cargo clean
 
 ## clean-all: Remove build artifacts and uninstall binary + daemon
-clean-all: clean daemon-uninstall uninstall
+clean-all: clean uninstall
 
 ## info: Show project info
 info:
@@ -103,12 +96,10 @@ help:
 	@grep -E '^## ' Makefile | sed 's/## /  /'
 	@echo ""
 	@echo "Examples:"
-	@echo "  make install                    # build + install the daemon binary (sudo)"
-	@echo "  make daemon-install             # install + register launchd daemon (boot + auto-restart)"
-	@echo "  make uninstall                  # remove the binary"
+	@echo "  make install                    # build + install binary + register launchd daemon (sudo)"
+	@echo "  make uninstall                  # unload daemon + remove binary"
 	@echo "  make daemon-status              # check daemon status"
 	@echo "  make daemon-stop                # stop daemon (auto-restarts)"
-	@echo "  make daemon-uninstall           # stop + remove daemon"
 	@echo "  make run ARGS='--help'          # run the daemon with --help"
 	@echo "  make run ARGS='--no-slow'       # fast mode, no cwd/fd collection"
 	@echo "  make run ARGS='--port 9090'     # run and serve the dashboard on :9090"
