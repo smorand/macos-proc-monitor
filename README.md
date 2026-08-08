@@ -19,8 +19,8 @@ Only one binary is produced: `macos-proc-monitor`.
 ## Install
 
 ```bash
-make install         # build release + install /usr/local/sbin/macos-proc-monitor + sudoers rule (sudo)
-make daemon-install  # install + register the launchd daemon (boot + auto-restart), serves :9090
+make install         # build release + install binary + sudoers + register/load launchd daemon (sudo), serves :9090
+make uninstall       # unload daemon + remove binary + sudoers + plist (sudo)
 ```
 
 Requires Rust 1.75+ and Cargo. DuckDB is bundled (compiled from source on first build, expect a longer initial build).
@@ -143,13 +143,13 @@ ORDER BY ts;
 
 ## Daemon (launchd)
 
-`make daemon-install` installs `launchd/com.smorand.macos-proc-monitor.plist`, which runs the daemon as root with:
+`make install` installs `launchd/com.smorand.macos-proc-monitor.plist`, which runs the daemon as root with:
 
 - data → `/var/db/macos-proc-monitor/data`, logs → `/var/db/macos-proc-monitor/logs`
 - `--data-retention 7 --log-retention 7 --port 9090 --bind 127.0.0.1`
 - `RunAtLoad` + `KeepAlive` (starts at boot, auto-restarts on crash)
 
-Manage it with `make daemon-start`, `make daemon-stop`, `make daemon-status`, `make daemon-uninstall`.
+Manage it with `make daemon-start`, `make daemon-stop`, `make daemon-status`, `make uninstall`.
 
 ## Sudo mode
 
