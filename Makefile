@@ -1,6 +1,5 @@
 .PHONY: build release install uninstall run clean clean-all info help test \
-        daemon-install daemon-uninstall daemon-start daemon-stop daemon-status \
-        analytics-build analytics-release analytics-install analytics-run install-all
+        daemon-install daemon-uninstall daemon-start daemon-stop daemon-status
 
 PROJECT_NAME  = macos-proc-monitor
 INSTALL_DIR   = /usr/local/sbin
@@ -17,7 +16,7 @@ build:
 release:
 	cargo build --release
 
-## install: Build release, install monitor + analytics + sudoers rule (requires sudo)
+## install: Build release, install the daemon binary + sudoers rule (requires sudo)
 install: release
 	@sudo mkdir -p $(INSTALL_DIR)
 	@sudo cp target/release/$(PROJECT_NAME) $(INSTALL_DIR)/$(PROJECT_NAME)
@@ -27,26 +26,19 @@ install: release
 	@sudo cp sudoers.d/$(PROJECT_NAME) /etc/sudoers.d/$(PROJECT_NAME)
 	@sudo chmod 440 /etc/sudoers.d/$(PROJECT_NAME)
 	@echo "Sudoers rule installed: /etc/sudoers.d/$(PROJECT_NAME)"
-	@sudo mkdir -p $(ANALYTICS_INSTALL_DIR)
-	@sudo cp target/release/macos-proc-analytics $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
-	@sudo chown root:wheel $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
-	@sudo chmod 755 $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
-	@echo "Installed macos-proc-analytics to $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics"
 
-## uninstall: Remove binaries and sudoers rule (requires sudo)
+## uninstall: Remove binary and sudoers rule (requires sudo)
 uninstall:
 	@sudo rm -f $(INSTALL_DIR)/$(PROJECT_NAME)
-	@sudo rm -f $(ANALYTICS_INSTALL_DIR)/macos-proc-analytics
 	@sudo rm -f /etc/sudoers.d/$(PROJECT_NAME)
-	@echo "Uninstalled $(PROJECT_NAME) and macos-proc-analytics"
+	@echo "Uninstalled $(PROJECT_NAME)"
 
 # ============================================================================
 # DAEMON (launchd)
 # ============================================================================
 
 ## daemon-install: Install and load the launchd daemon (requires sudo)
-## Data will be written to /var/db/macos-proc-monitor/data/ (Parquet files)
-## Point analytics at it: MACOS_PROC_MONITOR_FOLDER_DATA=/var/db/macos-proc-monitor/data macos-proc-analytics
+## Collects metrics to /var/db/macos-proc-monitor/data/ and serves the dashboard on http://127.0.0.1:9090
 daemon-install: install
 	@sudo mkdir -p $(LOG_DIR)
 	@sudo mkdir -p /var/db/macos-proc-monitor/data
@@ -57,6 +49,7 @@ daemon-install: install
 	@sudo launchctl unload -w $(LAUNCH_PLIST) 2>/dev/null || true
 	@sudo launchctl load -w $(LAUNCH_PLIST)
 	@echo "Daemon loaded: $(LAUNCH_LABEL)"
+	@echo "Dashboard: http://127.0.0.1:9090"
 	@echo "Logs: $(LOG_DIR)/"
 
 ## daemon-uninstall: Unload and remove the launchd daemon (requires sudo)
@@ -79,7 +72,7 @@ daemon-stop:
 daemon-status:
 	@sudo launchctl list | grep $(LAUNCH_LABEL) || echo "$(LAUNCH_LABEL) not running"
 
-## run: Run monitor in debug mode (pass extra flags via ARGS=)
+## run: Run the daemon in debug mode (pass extra flags via ARGS=)
 run:
 	cargo run -p macos-proc-monitor -- $(ARGS)
 
@@ -102,31 +95,6 @@ info:
 	@echo "Daemon:   $(LAUNCH_PLIST)"
 	@echo "Logs:     $(LOG_DIR)/"
 
-# ============================================================================
-# ANALYTICS
-# ============================================================================
-
-ANALYTICS_INSTALL_DIR = /usr/local/bin
-
-## analytics-build: Build debug analytics binary
-analytics-build:
-	cargo build -p macos-proc-analytics
-
-## analytics-release: Build release analytics binary
-analytics-release:
-	cargo build --release -p macos-proc-analytics
-
-## analytics-install: Alias for install (analytics is included in make install)
-analytics-install: install
-
-## analytics-run: Run analytics server in dev mode (pass ARGS= for extra flags)
-analytics-run:
-	cargo run -p macos-proc-analytics -- $(ARGS)
-
-## install-all: Install monitor + analytics + daemon
-install-all: install daemon-install
-	@echo "All components installed"
-
 ## help: Show this help
 help:
 	@echo "macos-proc-monitor Makefile"
@@ -135,13 +103,12 @@ help:
 	@grep -E '^## ' Makefile | sed 's/## /  /'
 	@echo ""
 	@echo "Examples:"
-	@echo "  make install                    # build + install monitor & analytics (sudo)"
+	@echo "  make install                    # build + install the daemon binary (sudo)"
 	@echo "  make daemon-install             # install + register launchd daemon (boot + auto-restart)"
-	@echo "  make install-all               # install + daemon in one shot"
-	@echo "  make uninstall                 # remove all binaries"
-	@echo "  make daemon-status             # check daemon status"
-	@echo "  make daemon-stop               # stop daemon (auto-restarts)"
-	@echo "  make daemon-uninstall          # stop + remove daemon"
-	@echo "  make analytics-run             # run analytics server in dev mode"
-	@echo "  make run ARGS='--help'         # run monitor with --help"
-	@echo "  make run ARGS='--no-slow'      # fast mode, no cwd/fd collection"
+	@echo "  make uninstall                  # remove the binary"
+	@echo "  make daemon-status              # check daemon status"
+	@echo "  make daemon-stop                # stop daemon (auto-restarts)"
+	@echo "  make daemon-uninstall           # stop + remove daemon"
+	@echo "  make run ARGS='--help'          # run the daemon with --help"
+	@echo "  make run ARGS='--no-slow'       # fast mode, no cwd/fd collection"
+	@echo "  make run ARGS='--port 9090'     # run and serve the dashboard on :9090"

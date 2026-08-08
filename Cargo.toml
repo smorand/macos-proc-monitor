@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/monitor", "crates/analytics"]
+members = ["crates/core", "crates/macos-proc-monitor"]
 resolver = "2"
 
 [profile.release]

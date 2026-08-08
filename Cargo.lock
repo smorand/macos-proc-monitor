@@ -123,6 +123,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1378,34 +1384,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "macos-proc-analytics"
+name = "macos-proc-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "arrow 53.4.1",
  "axum",
- "clap",
+ "chrono",
  "duckdb",
+ "parquet",
  "serde",
  "serde_json",
+ "sysinfo",
  "tokio",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uzers",
 ]
 
 [[package]]
 name = "macos-proc-monitor"
 version = "0.1.0"
 dependencies = [
- "arrow 53.4.1",
- "chrono",
+ "anyhow",
  "clap",
- "parquet",
- "serde",
- "serde_json",
- "sysinfo",
+ "macos-proc-core",
+ "tokio",
  "tracing",
- "tracing-subscriber",
- "uzers",
 ]
 
 [[package]]

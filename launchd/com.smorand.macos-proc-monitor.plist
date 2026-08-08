@@ -7,7 +7,7 @@
     <key>Label</key>
     <string>com.smorand.macos-proc-monitor</string>
 
-    <!-- Environment variables: fixed paths shared with macos-proc-analytics -->
+    <!-- Environment variables: fixed data/log paths for the daemon -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
@@ -26,6 +26,10 @@
         <string>7</string>
         <string>--log-retention</string>
         <string>7</string>
+        <string>--port</string>
+        <string>9090</string>
+        <string>--bind</string>
+        <string>127.0.0.1</string>
     </array>
 
     <!-- Start at boot, restart on crash -->

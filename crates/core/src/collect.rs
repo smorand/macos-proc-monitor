@@ -1,4 +1,4 @@
-//! macos-proc-monitor — collects per-process metrics every second, writes partitioned Parquet.
+//! Collection: per-process metrics sampled each second, written to partitioned Parquet.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -15,7 +15,6 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::{Local, Utc};
-use clap::Parser;
 use parquet::arrow::ArrowWriter;
 use serde::Serialize;
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
@@ -24,48 +23,32 @@ use tracing_subscriber::fmt::time::ChronoLocal;
 use uzers::get_user_by_uid;
 
 // ---------------------------------------------------------------------------
-// CLI
+// Collection configuration
 // ---------------------------------------------------------------------------
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "macos-proc-monitor",
-    about = "Collect per-process metrics every second, write to partitioned Parquet files",
-    long_about = None,
-    version
-)]
-struct Args {
+/// Configuration for the collection loop, built by the binary from CLI flags.
+#[derive(Debug, Clone)]
+pub struct CollectConfig {
     /// Sampling interval in seconds
-    #[arg(long, default_value = "1.0")]
-    interval: f64,
-
+    pub interval: f64,
     /// How often (in seconds) to collect cwd + num_fds
-    #[arg(long, default_value = "60")]
-    slow_interval: u64,
-
-    /// Prefix lsof calls with sudo (requires passwordless sudo for /usr/bin/lsof)
-    #[arg(long)]
-    sudo: bool,
-
+    pub slow_interval: u64,
+    /// Prefix lsof calls with sudo
+    pub sudo: bool,
     /// Never collect cwd / num_fds
-    #[arg(long)]
-    no_slow: bool,
-
-    /// Monitor only this PID and its children (omit for all processes)
-    #[arg(long)]
-    pid: Option<u32>,
-
+    pub no_slow: bool,
+    /// Monitor only this PID and its children (None = all processes)
+    pub pid: Option<u32>,
     /// Delete data rows older than this many days (0 = keep forever)
-    #[arg(long, default_value = "7")]
-    data_retention: u64,
-
+    pub data_retention: u64,
     /// Delete log files older than this many days (0 = keep forever)
-    #[arg(long, default_value = "7")]
-    log_retention: u64,
-
+    pub log_retention: u64,
     /// How often (in seconds) to flush buffered records to Parquet
-    #[arg(long, default_value = "30")]
-    flush_interval: u64,
+    pub flush_interval: u64,
+    /// Directory for Parquet output
+    pub data_dir: PathBuf,
+    /// Directory for log files
+    pub log_dir: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +206,7 @@ fn collect_slow_for_pid(pid: u32, use_sudo: bool) -> SlowFields {
 // Helpers: directory resolution
 // ---------------------------------------------------------------------------
 
-fn default_dir(env_var: &str, subdir: &str) -> PathBuf {
+pub fn default_dir(env_var: &str, subdir: &str) -> PathBuf {
     if let Ok(v) = std::env::var(env_var) {
         return PathBuf::from(v);
     }
@@ -347,7 +330,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StaticLogMakeWriter {
     }
 }
 
-fn init_logging(log_dir: &PathBuf, retention_days: u64) {
+pub fn init_logging(log_dir: &PathBuf, retention_days: u64) {
     let rotating = RotatingLogWriter::new(log_dir, retention_days)
         .expect("cannot open log file");
     LOG_STATE
@@ -482,7 +465,7 @@ fn build_record(
 }
 
 // ---------------------------------------------------------------------------
-// Filter: if --pid is set, collect only that pid + descendants
+// Filter: if pid is set, collect only that pid + descendants
 // ---------------------------------------------------------------------------
 
 fn reachable_pids(root: u32, children_map: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
@@ -500,44 +483,32 @@ fn reachable_pids(root: u32, children_map: &HashMap<u32, Vec<u32>>) -> Vec<u32> 
 }
 
 // ---------------------------------------------------------------------------
-// Main loop
+// Collection loop (blocking — run on a dedicated thread)
 // ---------------------------------------------------------------------------
 
-fn main() {
-    let args = Args::parse();
+pub fn collect_loop(cfg: CollectConfig) {
+    let data_dir = cfg.data_dir.clone();
 
-    let log_dir  = default_dir("MACOS_PROC_MONITOR_FOLDER_LOG", "logs");
-    let data_dir = default_dir("MACOS_PROC_MONITOR_FOLDER_DATA", "data");
-
-    if let Err(e) = fs::create_dir_all(&log_dir) {
-        eprintln!("Cannot create log dir {:?}: {e}", log_dir);
-    }
-    if let Err(e) = fs::create_dir_all(&data_dir) {
-        eprintln!("Cannot create data dir {:?}: {e}", data_dir);
-    }
-
-    init_logging(&log_dir, args.log_retention);
-
-    info!("macos-proc-monitor starting");
-    info!("log  -> {}/monitor-<date>.log", log_dir.display());
+    info!("macos-proc-monitor collection starting");
+    info!("log  -> {}/monitor-<date>.log", cfg.log_dir.display());
     info!(
         "data -> {}/ (parquet, flush every {}s)",
         data_dir.display(),
-        args.flush_interval
+        cfg.flush_interval
     );
     info!(
         "interval={}s  slow-interval={}s  sudo={}  no-slow={}",
-        args.interval, args.slow_interval, args.sudo, args.no_slow
+        cfg.interval, cfg.slow_interval, cfg.sudo, cfg.no_slow
     );
     info!(
         "retention: data={}d  logs={}d",
-        if args.data_retention == 0 { "inf".to_string() } else { args.data_retention.to_string() },
-        if args.log_retention == 0 { "inf".to_string() } else { args.log_retention.to_string() },
+        if cfg.data_retention == 0 { "inf".to_string() } else { cfg.data_retention.to_string() },
+        if cfg.log_retention == 0 { "inf".to_string() } else { cfg.log_retention.to_string() },
     );
 
-    let interval     = Duration::from_secs_f64(args.interval.max(0.1));
-    let slow_every   = Duration::from_secs(args.slow_interval.max(1));
-    let flush_every  = Duration::from_secs(args.flush_interval.max(1));
+    let interval     = Duration::from_secs_f64(cfg.interval.max(0.1));
+    let slow_every   = Duration::from_secs(cfg.slow_interval.max(1));
+    let flush_every  = Duration::from_secs(cfg.flush_interval.max(1));
 
     let refresh_kind = RefreshKind::nothing().with_processes(
         ProcessRefreshKind::everything()
@@ -570,13 +541,13 @@ fn main() {
 
         let children_map = build_children_map(&sys);
 
-        let do_slow = !args.no_slow && tick_start.duration_since(last_slow) >= slow_every;
+        let do_slow = !cfg.no_slow && tick_start.duration_since(last_slow) >= slow_every;
         if do_slow {
             last_slow = tick_start;
         }
 
         let all_pids: Vec<u32> = sys.processes().keys().map(|p| p.as_u32()).collect();
-        let target_pids: Vec<u32> = if let Some(root) = args.pid {
+        let target_pids: Vec<u32> = if let Some(root) = cfg.pid {
             reachable_pids(root, &children_map)
         } else {
             all_pids
@@ -592,7 +563,7 @@ fn main() {
             };
 
             if do_slow {
-                let slow_fields = collect_slow_for_pid(*pid, args.sudo);
+                let slow_fields = collect_slow_for_pid(*pid, cfg.sudo);
                 slow_cache.insert(*pid, slow_fields);
             }
 
@@ -636,12 +607,12 @@ fn main() {
         }
 
         // Daily retention purge of parquet files
-        if args.data_retention > 0 {
+        if cfg.data_retention > 0 {
             let today = Local::now().format("%Y-%m-%d").to_string();
             if today != last_retention_date {
                 last_retention_date = today;
-                purge_old_files(&data_dir, "parquet", args.data_retention);
-                info!("Parquet retention purge: removed files older than {}d", args.data_retention);
+                purge_old_files(&data_dir, "parquet", cfg.data_retention);
+                info!("Parquet retention purge: removed files older than {}d", cfg.data_retention);
             }
         }
 

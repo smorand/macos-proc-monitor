@@ -1,4 +1,4 @@
-//! macos-proc-analytics — Axum web dashboard, reads Parquet files via in-memory DuckDB.
+//! Web dashboard: Axum server reading Parquet files via in-memory DuckDB.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,35 +10,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use clap::Parser;
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing::info;
-
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "macos-proc-analytics",
-    about = "macOS process analytics web dashboard",
-    version
-)]
-struct Args {
-    /// TCP port to listen on
-    #[arg(long, default_value = "9090", env = "ANALYTICS_PORT")]
-    port: u16,
-
-    /// Bind address
-    #[arg(long, default_value = "127.0.0.1", env = "ANALYTICS_BIND")]
-    bind: String,
-
-    /// Directory containing .parquet files (default: $MACOS_PROC_MONITOR_FOLDER_DATA or ~/.cache/macos-proc-monitor/data/)
-    #[arg(long, env = "ANALYTICS_DATA_DIR")]
-    data_dir: Option<PathBuf>,
-}
 
 // ---------------------------------------------------------------------------
 // App state
@@ -340,33 +315,12 @@ async fn api_processes(
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Serve the web dashboard (async — run on the tokio runtime)
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
-    let args = Args::parse();
-
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_level(true)
-        .init();
-
-    let data_dir = args.data_dir.unwrap_or_else(|| {
-        if let Ok(d) = std::env::var("MACOS_PROC_MONITOR_FOLDER_DATA") {
-            PathBuf::from(d)
-        } else if let Ok(home) = std::env::var("HOME") {
-            PathBuf::from(home)
-                .join(".cache")
-                .join("macos-proc-monitor")
-                .join("data")
-        } else {
-            PathBuf::from("/var/db/macos-proc-monitor/data")
-        }
-    });
-
-    info!("Data dir: {}", data_dir.display());
-    info!("Listening on {}:{}", args.bind, args.port);
+pub async fn serve_web(bind: String, port: u16, data_dir: PathBuf) -> anyhow::Result<()> {
+    info!("Web dashboard data dir: {}", data_dir.display());
+    info!("Web dashboard listening on {}:{}", bind, port);
 
     let state = Arc::new(AppState { data_dir });
 
@@ -381,10 +335,11 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr: std::net::SocketAddr = format!("{}:{}", args.bind, args.port)
+    let addr: std::net::SocketAddr = format!("{}:{}", bind, port)
         .parse()
-        .expect("invalid bind address");
+        .map_err(|e| anyhow::anyhow!("invalid bind address {bind}:{port}: {e}"))?;
 
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("cannot bind");
-    axum::serve(listener, app).await.expect("server error");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
