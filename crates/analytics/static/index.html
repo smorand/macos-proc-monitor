@@ -304,6 +304,10 @@
     <button class="window-btn" data-window="900">15m</button>
     <button class="window-btn" data-window="3600">1h</button>
     <button class="window-btn" data-window="21600">6h</button>
+    <button class="window-btn" data-window="43200">12h</button>
+    <button class="window-btn" data-window="86400">1d</button>
+    <button class="window-btn" data-window="259200">3d</button>
+    <button class="window-btn" data-window="604800">7d</button>
   </div>
 
   <div class="sep"></div>
@@ -326,6 +330,8 @@
     <button class="window-btn" data-interval="300">5m</button>
     <button class="window-btn off-btn" data-interval="0">Off</button>
   </div>
+  <!-- hidden: tracks the auto-selected interval, updated by window buttons -->
+  <span id="auto-refresh-marker" style="display:none"></span>
 
   <div class="refresh-info" id="refresh-info">Next in <span id="countdown">5</span>s</div>
 </div>
@@ -398,6 +404,7 @@
   let currentWindow = 300;
   let currentUser = '';
   let refreshInterval = 5;  // seconds; 0 = off
+  let userOverrideRefresh = false; // true when user manually picked a refresh rate
   let countdown = 5;
   let countdownTimer = null;
 
@@ -516,13 +523,33 @@
 
   // --- Users dropdown ---
 
+  // Returns the auto-refresh interval (seconds) appropriate for a given window size.
+  function autoRefreshFor(windowSecs) {
+    if (windowSecs <= 60)   return 5;
+    if (windowSecs <= 900)  return 30;
+    if (windowSecs <= 3600) return 60;
+    return 300;
+  }
+
+  function applyRefreshInterval(secs) {
+    refreshInterval = secs;
+    document.querySelectorAll('[data-interval]').forEach(b => {
+      b.classList.toggle('active', parseInt(b.dataset.interval) === secs);
+    });
+  }
+
   async function loadUsers() {
     const r = await fetch(`${BASE_URL}/api/users?window=${currentWindow}`);
     const data = await r.json();
     const sel = document.getElementById('user-filter');
     const prev = sel.value;
+
+    // Collapse _* accounts into a single virtual "system" entry
+    const hasSystem = data.some(u => u.startsWith('_'));
+    const others = data.filter(u => u && !u.startsWith('_'));
     sel.innerHTML = '<option value="">All users</option>' +
-      data.filter(u => u).map(u => `<option value="${u}">${u}</option>`).join('');
+      (hasSystem ? '<option value="__system">system</option>' : '') +
+      others.map(u => `<option value="${u}">${u}</option>`).join('');
     if (prev) sel.value = prev;
   }
 
@@ -661,6 +688,9 @@
       document.querySelectorAll('[data-window]').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       currentWindow = parseInt(btn.dataset.window);
+      if (!userOverrideRefresh) {
+        applyRefreshInterval(autoRefreshFor(currentWindow));
+      }
       if (chartTimeline) { chartTimeline.destroy(); chartTimeline = null; }
       refresh();
     });
@@ -670,9 +700,8 @@
 
   document.querySelectorAll('[data-interval]').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('[data-interval]').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      refreshInterval = parseInt(btn.dataset.interval);
+      userOverrideRefresh = true;
+      applyRefreshInterval(parseInt(btn.dataset.interval));
       clearInterval(countdownTimer);
       scheduleNext();
     });

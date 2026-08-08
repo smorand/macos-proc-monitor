@@ -170,6 +170,7 @@ async fn index() -> Html<&'static str> {
 
 fn user_clause(user: &Option<String>) -> String {
     match user.as_deref() {
+        Some("__system") => r" AND user_name LIKE '\_%'".to_string(),
         Some(u) if !u.is_empty() => format!(" AND user_name = '{}'", u.replace('\'', "''")),
         _ => String::new(),
     }
