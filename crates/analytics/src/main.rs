@@ -56,6 +56,7 @@ struct AppState {
 struct WindowParams {
     #[serde(default = "default_window")]
     window: i64,
+    user: Option<String>,
 }
 
 fn default_window() -> i64 { 300 }
@@ -66,6 +67,7 @@ struct TopParams {
     window: i64,
     #[serde(default = "default_limit")]
     limit: i64,
+    user: Option<String>,
 }
 
 fn default_limit() -> i64 { 10 }
@@ -166,11 +168,19 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
 
+fn user_clause(user: &Option<String>) -> String {
+    match user.as_deref() {
+        Some(u) if !u.is_empty() => format!(" AND user_name = '{}'", u.replace('\'', "''")),
+        _ => String::new(),
+    }
+}
+
 async fn api_summary(
     State(state): State<Arc<AppState>>,
     Query(params): Query<WindowParams>,
 ) -> Result<Json<SummaryResponse>, AppError> {
     let conn = open_db(&state.data_dir)?;
+    let uf = user_clause(&params.user);
     let sql = format!(
         "SELECT
             count(DISTINCT pid) as active_procs,
@@ -179,10 +189,10 @@ async fn api_summary(
          FROM (
              SELECT pid, avg(cpu_percent) as cpu_percent, max(mem_rss) as mem_rss
              FROM proc_metrics
-             WHERE ts > {}
+             WHERE ts > {}{}
              GROUP BY pid
          )",
-        cutoff(params.window)
+        cutoff(params.window), uf
     );
     let mut stmt = conn.prepare(&sql)?;
     let row = stmt.query_row([], |r| {
@@ -200,17 +210,18 @@ async fn api_top_cpu(
     Query(params): Query<TopParams>,
 ) -> Result<Json<Vec<TopEntry>>, AppError> {
     let conn = open_db(&state.data_dir)?;
+    let uf = user_clause(&params.user);
     let sql = format!(
         "SELECT name, user_name,
                 round(avg(cpu_percent), 2) as avg_cpu,
                 max(mem_rss) as peak_rss,
                 count(DISTINCT pid) as instances
          FROM proc_metrics
-         WHERE ts > {}
+         WHERE ts > {}{}
          GROUP BY name, user_name
          ORDER BY avg_cpu DESC
          LIMIT {}",
-        cutoff(params.window), params.limit
+        cutoff(params.window), uf, params.limit
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -231,17 +242,18 @@ async fn api_top_mem(
     Query(params): Query<TopParams>,
 ) -> Result<Json<Vec<TopEntry>>, AppError> {
     let conn = open_db(&state.data_dir)?;
+    let uf = user_clause(&params.user);
     let sql = format!(
         "SELECT name, user_name,
                 round(avg(cpu_percent), 2) as avg_cpu,
                 max(mem_rss) as peak_rss,
                 count(DISTINCT pid) as instances
          FROM proc_metrics
-         WHERE ts > {}
+         WHERE ts > {}{}
          GROUP BY name, user_name
          ORDER BY peak_rss DESC
          LIMIT {}",
-        cutoff(params.window), params.limit
+        cutoff(params.window), uf, params.limit
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -281,18 +293,37 @@ async fn api_timeline(
     Ok(Json(entries?))
 }
 
+async fn api_users(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<WindowParams>,
+) -> Result<Json<Vec<String>>, AppError> {
+    let conn = open_db(&state.data_dir)?;
+    let sql = format!(
+        "SELECT DISTINCT coalesce(user_name, '') as user_name
+         FROM proc_metrics
+         WHERE ts > {}
+         ORDER BY user_name",
+        cutoff(params.window)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let entries: Result<Vec<_>, _> = rows.collect();
+    Ok(Json(entries?))
+}
+
 async fn api_processes(
     State(state): State<Arc<AppState>>,
     Query(params): Query<WindowParams>,
 ) -> Result<Json<Vec<ProcessEntry>>, AppError> {
     let conn = open_db(&state.data_dir)?;
+    let uf = user_clause(&params.user);
     let sql = format!(
         "SELECT DISTINCT pid, name, user_name, max(ts) as last_seen
          FROM proc_metrics
-         WHERE ts > {}
+         WHERE ts > {}{}
          GROUP BY pid, name, user_name
          ORDER BY name",
-        cutoff(params.window)
+        cutoff(params.window), uf
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -345,6 +376,7 @@ async fn main() {
         .route("/api/top-mem", get(api_top_mem))
         .route("/api/timeline", get(api_timeline))
         .route("/api/processes", get(api_processes))
+        .route("/api/users", get(api_users))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

@@ -53,15 +53,26 @@
     padding: 10px 24px;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 12px;
     border-bottom: 1px solid var(--border);
     flex-wrap: wrap;
   }
 
-  .window-bar span {
+  .window-bar .group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .window-bar .sep {
+    width: 1px;
+    height: 20px;
+    background: var(--border);
+  }
+
+  .window-bar span.label {
     font-size: 12px;
     color: var(--muted);
-    margin-right: 4px;
   }
 
   .window-btn {
@@ -78,10 +89,24 @@
   .window-btn:hover { background: #1a4a80; }
   .window-btn.active { background: var(--active-btn); border-color: var(--active-btn); }
 
+  .window-btn.off-btn.active { background: #555; border-color: #666; }
+
+  select.bar-select {
+    background: var(--accent);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    min-width: 130px;
+  }
+
   .refresh-info {
     margin-left: auto;
     font-size: 12px;
     color: var(--muted);
+    white-space: nowrap;
   }
 
   main {
@@ -118,6 +143,15 @@
     font-size: 24px;
     font-weight: 700;
     color: var(--highlight);
+  }
+
+  .summary-card .sub {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .grid {
@@ -263,13 +297,35 @@
 </header>
 
 <div class="window-bar">
-  <span>Window:</span>
-  <button class="window-btn" data-window="60">1m</button>
-  <button class="window-btn active" data-window="300">5m</button>
-  <button class="window-btn" data-window="900">15m</button>
-  <button class="window-btn" data-window="3600">1h</button>
-  <button class="window-btn" data-window="21600">6h</button>
-  <div class="refresh-info">Auto-refresh in <span id="countdown">5</span>s</div>
+  <div class="group">
+    <span class="label">Window:</span>
+    <button class="window-btn" data-window="60">1m</button>
+    <button class="window-btn active" data-window="300">5m</button>
+    <button class="window-btn" data-window="900">15m</button>
+    <button class="window-btn" data-window="3600">1h</button>
+    <button class="window-btn" data-window="21600">6h</button>
+  </div>
+
+  <div class="sep"></div>
+
+  <div class="group">
+    <span class="label">User:</span>
+    <select class="bar-select" id="user-filter">
+      <option value="">All users</option>
+    </select>
+  </div>
+
+  <div class="sep"></div>
+
+  <div class="group">
+    <span class="label">Refresh:</span>
+    <button class="window-btn" data-interval="2">2s</button>
+    <button class="window-btn active" data-interval="5">5s</button>
+    <button class="window-btn" data-interval="30">30s</button>
+    <button class="window-btn off-btn" data-interval="0">Off</button>
+  </div>
+
+  <div class="refresh-info" id="refresh-info">Next in <span id="countdown">5</span>s</div>
 </div>
 
 <main>
@@ -285,6 +341,11 @@
     <div class="summary-card">
       <div class="label">Total RAM (RSS)</div>
       <div class="value" id="sum-ram">--</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">By User</div>
+      <div class="value" id="sum-user">--</div>
+      <div class="sub" id="sum-user-name">all users</div>
     </div>
   </div>
 
@@ -325,7 +386,7 @@
 </main>
 
 <footer>
-  <span id="footer-db">DB: ~/.cache/macos-proc-monitor/data/procs.duckdb</span>
+  <span id="footer-db">Data: /var/db/macos-proc-monitor/data/</span>
   <span id="footer-procs"></span>
   <span id="footer-cpu"></span>
   <span id="footer-ram"></span>
@@ -333,8 +394,9 @@
 
 <script>
   let currentWindow = 300;
+  let currentUser = '';
+  let refreshInterval = 5;  // seconds; 0 = off
   let countdown = 5;
-  let refreshTimer = null;
   let countdownTimer = null;
 
   let chartCpu = null;
@@ -353,13 +415,10 @@
     return bytes + ' B';
   }
 
-  function fmtCpu(v) {
-    return (v || 0).toFixed(1) + '%';
-  }
+  function fmtCpu(v) { return (v || 0).toFixed(1) + '%'; }
+  function fmtTs(ts)  { return new Date(ts * 1000).toLocaleTimeString(); }
 
-  function fmtTs(ts) {
-    return new Date(ts * 1000).toLocaleTimeString();
-  }
+  function userQS() { return currentUser ? `&user=${encodeURIComponent(currentUser)}` : ''; }
 
   // --- Chart helpers ---
 
@@ -369,14 +428,8 @@
     maintainAspectRatio: false,
     plugins: { legend: { display: false }, tooltip: { callbacks: {} } },
     scales: {
-      x: {
-        grid: { color: '#2a2a4e' },
-        ticks: { color: '#888', font: { size: 10 } }
-      },
-      y: {
-        grid: { color: '#2a2a4e' },
-        ticks: { color: '#ccc', font: { size: 11 } }
-      }
+      x: { grid: { color: '#2a2a4e' }, ticks: { color: '#888', font: { size: 10 } } },
+      y: { grid: { color: '#2a2a4e' }, ticks: { color: '#ccc', font: { size: 11 } } }
     }
   };
 
@@ -389,11 +442,7 @@
         ...chartDefaults,
         plugins: {
           legend: { display: false },
-          tooltip: {
-            callbacks: {
-              label: (ctx) => tooltipFmt(ctx.raw)
-            }
-          }
+          tooltip: { callbacks: { label: (ctx) => tooltipFmt(ctx.raw) } }
         }
       }
     });
@@ -408,7 +457,7 @@
   // --- Summary ---
 
   async function loadSummary() {
-    const r = await fetch(`${BASE_URL}/api/summary?window=${currentWindow}`);
+    const r = await fetch(`${BASE_URL}/api/summary?window=${currentWindow}${userQS()}`);
     const d = await r.json();
     document.getElementById('sum-procs').textContent = d.active_procs ?? '--';
     document.getElementById('sum-cpu').textContent = fmtCpu(d.total_cpu);
@@ -416,20 +465,25 @@
     document.getElementById('footer-procs').textContent = `Active: ${d.active_procs} procs`;
     document.getElementById('footer-cpu').textContent = `CPU: ${fmtCpu(d.total_cpu)}`;
     document.getElementById('footer-ram').textContent = `RAM: ${fmtBytes(d.total_rss)}`;
+
+    // 4th card: same numbers scoped to user, or total count of users
+    if (currentUser) {
+      document.getElementById('sum-user').textContent = d.active_procs;
+      document.getElementById('sum-user-name').textContent = currentUser;
+    } else {
+      // show count of distinct users from dropdown
+      const count = document.getElementById('user-filter').options.length - 1; // minus "All users"
+      document.getElementById('sum-user').textContent = count;
+      document.getElementById('sum-user-name').textContent = 'distinct users';
+    }
   }
 
   // --- Top CPU ---
 
   async function loadTopCpu() {
-    const r = await fetch(`${BASE_URL}/api/top?window=${currentWindow}&limit=10`);
+    const r = await fetch(`${BASE_URL}/api/top?window=${currentWindow}&limit=10${userQS()}`);
     const data = await r.json();
-
-    updateBarChart(
-      chartCpu,
-      data.map(d => d.name),
-      data.map(d => d.avg_cpu)
-    );
-
+    updateBarChart(chartCpu, data.map(d => d.name), data.map(d => d.avg_cpu));
     const tbody = document.querySelector('#table-cpu tbody');
     tbody.innerHTML = data.map(d =>
       `<tr>
@@ -444,15 +498,9 @@
   // --- Top RAM ---
 
   async function loadTopMem() {
-    const r = await fetch(`${BASE_URL}/api/top-mem?window=${currentWindow}&limit=10`);
+    const r = await fetch(`${BASE_URL}/api/top-mem?window=${currentWindow}&limit=10${userQS()}`);
     const data = await r.json();
-
-    updateBarChart(
-      chartMem,
-      data.map(d => d.name),
-      data.map(d => d.peak_rss / (1024 * 1024))
-    );
-
+    updateBarChart(chartMem, data.map(d => d.name), data.map(d => d.peak_rss / (1024 * 1024)));
     const tbody = document.querySelector('#table-mem tbody');
     tbody.innerHTML = data.map(d =>
       `<tr>
@@ -464,31 +512,53 @@
     ).join('');
   }
 
+  // --- Users dropdown ---
+
+  async function loadUsers() {
+    const r = await fetch(`${BASE_URL}/api/users?window=${currentWindow}`);
+    const data = await r.json();
+    const sel = document.getElementById('user-filter');
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">All users</option>' +
+      data.filter(u => u).map(u => `<option value="${u}">${u}</option>`).join('');
+    if (prev) sel.value = prev;
+  }
+
   // --- Processes dropdown ---
 
   async function loadProcesses() {
-    const r = await fetch(`${BASE_URL}/api/processes?window=${currentWindow}`);
+    const r = await fetch(`${BASE_URL}/api/processes?window=${currentWindow}${userQS()}`);
     const data = await r.json();
     const sel = document.getElementById('proc-select');
     const prev = sel.value;
     sel.innerHTML = '<option value="">-- select a process --</option>' +
       data.map(d => `<option value="${d.pid}">${d.name} (${d.pid})</option>`).join('');
-    if (prev) sel.value = prev;
-    if (sel.value) loadTimeline(parseInt(sel.value));
+    // restore previous selection only if that pid is still in the list
+    if (prev && [...sel.options].some(o => o.value === prev)) {
+      sel.value = prev;
+    }
   }
 
   // --- Timeline ---
 
-  async function loadTimeline(pid) {
+  async function loadTimeline() {
+    const sel = document.getElementById('proc-select');
+    const pid = parseInt(sel.value);
     if (!pid) return;
+
     const r = await fetch(`${BASE_URL}/api/timeline?pid=${pid}&window=${currentWindow}`);
     const data = await r.json();
 
-    const labels = data.map(d => fmtTs(d.ts));
+    const labels  = data.map(d => fmtTs(d.ts));
     const cpuData = data.map(d => d.cpu_percent);
     const memData = data.map(d => d.mem_rss / (1024 * 1024));
 
-    if (!chartTimeline) {
+    if (chartTimeline) {
+      chartTimeline.data.labels = labels;
+      chartTimeline.data.datasets[0].data = cpuData;
+      chartTimeline.data.datasets[1].data = memData;
+      chartTimeline.update('none');
+    } else {
       const ctx = document.getElementById('chart-timeline').getContext('2d');
       chartTimeline = new Chart(ctx, {
         type: 'line',
@@ -524,10 +594,7 @@
           maintainAspectRatio: false,
           interaction: { mode: 'index', intersect: false },
           plugins: {
-            legend: {
-              display: true,
-              labels: { color: '#ccc', font: { size: 11 } }
-            }
+            legend: { display: true, labels: { color: '#ccc', font: { size: 11 } } }
           },
           scales: {
             x: {
@@ -535,25 +602,18 @@
               ticks: { color: '#888', font: { size: 9 }, maxTicksLimit: 10, maxRotation: 0 }
             },
             yCpu: {
-              type: 'linear',
-              position: 'left',
+              type: 'linear', position: 'left',
               grid: { color: '#2a2a4e' },
               ticks: { color: '#e94560', font: { size: 10 }, callback: v => v + '%' }
             },
             yMem: {
-              type: 'linear',
-              position: 'right',
+              type: 'linear', position: 'right',
               grid: { drawOnChartArea: false },
               ticks: { color: '#2a9d8f', font: { size: 10 }, callback: v => v.toFixed(0) + ' MB' }
             }
           }
         }
       });
-    } else {
-      chartTimeline.data.labels = labels;
-      chartTimeline.data.datasets[0].data = cpuData;
-      chartTimeline.data.datasets[1].data = memData;
-      chartTimeline.update('none');
     }
   }
 
@@ -561,22 +621,30 @@
 
   async function refresh() {
     try {
-      await Promise.all([loadSummary(), loadTopCpu(), loadTopMem(), loadProcesses()]);
+      await Promise.all([loadSummary(), loadTopCpu(), loadTopMem(), loadUsers(), loadProcesses()]);
+      // refresh timeline in background without blocking
+      loadTimeline();
       document.getElementById('last-updated').textContent =
         'Updated: ' + new Date().toLocaleTimeString();
     } catch(e) {
       document.getElementById('last-updated').textContent = 'Error: ' + e.message;
     }
-    resetCountdown();
+    scheduleNext();
   }
 
-  function resetCountdown() {
-    countdown = 5;
-    document.getElementById('countdown').textContent = countdown;
+  function scheduleNext() {
     clearInterval(countdownTimer);
+    if (refreshInterval === 0) {
+      document.getElementById('refresh-info').textContent = 'Auto-refresh off';
+      return;
+    }
+    countdown = refreshInterval;
+    document.getElementById('refresh-info').innerHTML =
+      'Next in <span id="countdown">' + countdown + '</span>s';
     countdownTimer = setInterval(() => {
       countdown--;
-      document.getElementById('countdown').textContent = countdown;
+      const el = document.getElementById('countdown');
+      if (el) el.textContent = countdown;
       if (countdown <= 0) {
         clearInterval(countdownTimer);
         refresh();
@@ -584,26 +652,48 @@
     }, 1000);
   }
 
-  // --- Init ---
+  // --- Window buttons ---
 
-  document.querySelectorAll('.window-btn').forEach(btn => {
+  document.querySelectorAll('[data-window]').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('.window-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('[data-window]').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       currentWindow = parseInt(btn.dataset.window);
-      // Reset timeline chart so it recreates with new window
       if (chartTimeline) { chartTimeline.destroy(); chartTimeline = null; }
       refresh();
     });
   });
 
-  document.getElementById('proc-select').addEventListener('change', e => {
-    const pid = parseInt(e.target.value);
-    if (chartTimeline) { chartTimeline.destroy(); chartTimeline = null; }
-    if (pid) loadTimeline(pid);
+  // --- Refresh interval buttons ---
+
+  document.querySelectorAll('[data-interval]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('[data-interval]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      refreshInterval = parseInt(btn.dataset.interval);
+      clearInterval(countdownTimer);
+      scheduleNext();
+    });
   });
 
-  // Init charts
+  // --- User filter ---
+
+  document.getElementById('user-filter').addEventListener('change', e => {
+    currentUser = e.target.value;
+    // timeline: reset so the new process list (filtered) shows up cleanly
+    if (chartTimeline) { chartTimeline.destroy(); chartTimeline = null; }
+    refresh();
+  });
+
+  // --- Process select ---
+
+  document.getElementById('proc-select').addEventListener('change', () => {
+    if (chartTimeline) { chartTimeline.destroy(); chartTimeline = null; }
+    loadTimeline();
+  });
+
+  // --- Init charts ---
+
   chartCpu = makeBarChart('chart-cpu', '#e94560', v => fmtCpu(v));
   chartMem = makeBarChart('chart-mem', '#2a9d8f', v => v.toFixed(1) + ' MB');
 
