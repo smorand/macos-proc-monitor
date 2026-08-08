@@ -45,7 +45,7 @@ uninstall:
 # ============================================================================
 
 ## daemon-install: Install and load the launchd daemon (requires sudo)
-## Data will be written to /var/db/macos-proc-monitor/data/procs.duckdb
+## Data will be written to /var/db/macos-proc-monitor/data/ (Parquet files)
 ## Point analytics at it: MACOS_PROC_MONITOR_FOLDER_DATA=/var/db/macos-proc-monitor/data macos-proc-analytics
 daemon-install: install
 	@sudo mkdir -p $(LOG_DIR)
@@ -54,6 +54,7 @@ daemon-install: install
 	@sudo cp launchd/$(LAUNCH_LABEL).plist $(LAUNCH_PLIST)
 	@sudo chown root:wheel $(LAUNCH_PLIST)
 	@sudo chmod 644 $(LAUNCH_PLIST)
+	@sudo launchctl unload -w $(LAUNCH_PLIST) 2>/dev/null || true
 	@sudo launchctl load -w $(LAUNCH_PLIST)
 	@echo "Daemon loaded: $(LAUNCH_LABEL)"
 	@echo "Logs: $(LOG_DIR)/"
