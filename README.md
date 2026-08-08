@@ -11,8 +11,8 @@ The collection loop runs on a dedicated blocking thread; the web server runs on 
 
 Cargo workspace with two crates:
 
-- `crates/core` (lib `procmon`, package `macos-proc-core`): collection (`collect.rs`) + web dashboard (`web.rs`). The dashboard HTML lives in `crates/core/static/index.html` (embedded via `include_str!`).
-- `crates/macos-proc-monitor` (bin `macos-proc-monitor`): merged CLI, resolves data/log dirs, spawns the collection thread, then serves the web dashboard.
+- `crates/core` (lib `procmon`, package `macos-proc-core`): collection (`collect.rs`), web dashboard (`web.rs`), typed config (`config.rs`, figment + XDG dirs), telemetry (`telemetry.rs`, tracing + rolling file logs), and error types (`error.rs`, thiserror). The dashboard HTML lives in `crates/core/static/index.html` (embedded via `include_str!`).
+- `crates/macos-proc-monitor` (bin `macos-proc-monitor`): thin entry point (sync `main -> ExitCode`, async `run`), loads config, resolves data/log dirs, spawns the collection thread, then serves the web dashboard with graceful shutdown.
 
 Only one binary is produced: `macos-proc-monitor`.
 
@@ -23,7 +23,18 @@ make install         # build release + install binary + sudoers + register/load 
 make uninstall       # unload daemon + remove binary + sudoers + plist (sudo)
 ```
 
-Requires Rust 1.75+ and Cargo. DuckDB is bundled (compiled from source on first build, expect a longer initial build).
+Requires Rust (edition 2024, MSRV 1.87) and Cargo. The toolchain is pinned via `rust-toolchain.toml`. DuckDB is bundled (compiled from source on first build, expect a longer initial build).
+
+### Development
+
+```bash
+make check     # full quality gate: format-check, clippy -D warnings, typecheck, security (audit + deny), coverage >= 80%, doc
+make test      # run all tests (unit + integration + e2e)
+make lint      # clippy with warnings denied
+make format    # rustfmt
+```
+
+Run `make check` before every commit.
 
 ## Usage
 
@@ -41,12 +52,17 @@ Collection options:
   --flush-interval <s>    Seconds between Parquet flushes (default: 30)
 
 Web dashboard options:
-  --port <port>           Dashboard TCP port (default: 9090, env ANALYTICS_PORT)
-  --bind <addr>           Dashboard bind address (default: 127.0.0.1, env ANALYTICS_BIND)
+  --port <port>           Dashboard TCP port (default: 9090)
+  --bind <addr>           Dashboard bind address (default: 127.0.0.1)
 
+  --config <path>         Optional TOML config file (default: XDG config dir)
   -h, --help              Print help
   -V, --version           Print version
 ```
+
+Flags are optional: each falls back to the config file, then env vars
+(`MACOS_PROC_MONITOR_*`), then built-in defaults. A flag passed on the command
+line always wins.
 
 The web dashboard is always served; there is no way to disable it. Open `http://127.0.0.1:9090` once the daemon is running.
 
@@ -70,19 +86,33 @@ macos-proc-monitor --bind 0.0.0.0 --port 8080
 sudo macos-proc-monitor --sudo
 ```
 
+## Configuration
+
+Settings resolve in this order, later layers overriding earlier ones:
+
+1. Built-in defaults.
+2. TOML file: `--config <path>`, or `~/.config/macos-proc-monitor/config.toml` (a missing file is ignored). Keys match the field names, e.g. `port = 9090`, `interval = 1.0`, `no_slow = true`.
+3. Environment variables prefixed `MACOS_PROC_MONITOR_` (e.g. `MACOS_PROC_MONITOR_PORT=8080`).
+4. CLI flags.
+
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `MACOS_PROC_MONITOR_FOLDER_LOG` | `~/.cache/macos-proc-monitor/logs/` | Directory for log files |
-| `MACOS_PROC_MONITOR_FOLDER_DATA` | `~/.cache/macos-proc-monitor/data/` | Directory for Parquet data files |
-| `ANALYTICS_PORT` | `9090` | Dashboard TCP port |
-| `ANALYTICS_BIND` | `127.0.0.1` | Dashboard bind address |
+| `MACOS_PROC_MONITOR_FOLDER_LOG` | `~/.cache/macos-proc-monitor/logs/` | Directory for log files (overrides all) |
+| `MACOS_PROC_MONITOR_FOLDER_DATA` | `~/.cache/macos-proc-monitor/data/` | Directory for Parquet data files (overrides all) |
+| `MACOS_PROC_MONITOR_PORT` | `9090` | Dashboard TCP port |
+| `MACOS_PROC_MONITOR_BIND` | `127.0.0.1` | Dashboard bind address |
+| `RUST_LOG` | `info` | Log verbosity (tracing `EnvFilter` syntax) |
+
+Directory resolution: the `_FOLDER_*` env vars win; otherwise the XDG cache dir
+(`~/.cache/macos-proc-monitor/{data,logs}`); otherwise `/var/db/macos-proc-monitor/{data,logs}`
+(the launchd daemon runs as root and sets the env vars explicitly).
 
 Both directories are created automatically on first run.
 
 Data files are named `YYYY-MM-DDTHH_NNNNNN.parquet` (one hour partition, sequential flushes).
-Log files are named `monitor-YYYY-MM-DD.log` and rotate at midnight.
+Log files are named `monitor.YYYY-MM-DD.log` and roll daily (tracing-appender).
 
 ## Parquet schema
 
@@ -112,12 +142,20 @@ The daemon exposes these JSON endpoints (all read from the Parquet data via an i
 | Route | Description |
 |---|---|
 | `GET /` | Dashboard HTML |
+| `GET /health/live` | Liveness (always OK) + version |
+| `GET /health/ready` | Readiness: 200 if the data dir is queryable, else 503 |
+| `GET /health` | Alias for `/health/live` |
 | `GET /api/summary?window=<s>&user=<u>` | Active procs, total CPU, total RSS over the window |
 | `GET /api/top?window=<s>&limit=<n>&user=<u>` | Top processes by average CPU |
 | `GET /api/top-mem?window=<s>&limit=<n>&user=<u>` | Top processes by peak RSS |
 | `GET /api/timeline?pid=<p>&window=<s>` | CPU/RSS timeline for one PID |
 | `GET /api/processes?window=<s>&user=<u>` | Distinct processes seen in the window |
 | `GET /api/users?window=<s>` | Distinct users seen in the window |
+
+Data endpoints are also served under the versioned prefix `/api/v1/*` (e.g.
+`/api/v1/summary`); the embedded dashboard uses the legacy `/api/*` paths.
+5xx responses return a sanitized `{"error":"internal server error"}` body; the
+full error is logged server-side.
 
 `user=__system` filters to system users (names starting with `_`).
 

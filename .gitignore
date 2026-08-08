@@ -2,6 +2,11 @@
 /target/
 *.pdb
 
+# Coverage (cargo-llvm-cov)
+/lcov.info
+*.profraw
+*.profdata
+
 # Editor
 .DS_Store
 .idea/

@@ -1,19 +1,22 @@
 //! Web dashboard: Axum server reading Parquet files via in-memory DuckDB.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 use tracing::info;
+
+use crate::VERSION;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -34,7 +37,9 @@ struct WindowParams {
     user: Option<String>,
 }
 
-fn default_window() -> i64 { 300 }
+fn default_window() -> i64 {
+    300
+}
 
 #[derive(Deserialize)]
 struct TopParams {
@@ -45,7 +50,9 @@ struct TopParams {
     user: Option<String>,
 }
 
-fn default_limit() -> i64 { 10 }
+fn default_limit() -> i64 {
+    10
+}
 
 #[derive(Deserialize)]
 struct TimelineParams {
@@ -54,7 +61,9 @@ struct TimelineParams {
     window: i64,
 }
 
-fn default_timeline_window() -> i64 { 3600 }
+fn default_timeline_window() -> i64 {
+    3600
+}
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -99,19 +108,27 @@ struct AppError(String);
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, self.0).into_response()
+        // Log the full detail server-side; return a generic body (never leak internals).
+        tracing::error!(error = %self.0, "api request failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "internal server error" })),
+        )
+            .into_response()
     }
 }
 
 impl From<duckdb::Error> for AppError {
-    fn from(e: duckdb::Error) -> Self { AppError(e.to_string()) }
+    fn from(e: duckdb::Error) -> Self {
+        AppError(e.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Open in-memory DuckDB and create a view over all parquet files
 // ---------------------------------------------------------------------------
 
-fn open_db(data_dir: &PathBuf) -> Result<Connection, duckdb::Error> {
+fn open_db(data_dir: &Path) -> Result<Connection, duckdb::Error> {
     let conn = Connection::open_in_memory()?;
     // Glob matches all parquet files written by the monitor (YYYY-MM-DDTHH_NNNNNN.parquet)
     let pattern = data_dir.join("*.parquet").to_string_lossy().to_string();
@@ -132,7 +149,10 @@ fn cutoff(window_secs: i64) -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    now - window_secs as f64
+    // Window seconds are small; f64 represents them exactly.
+    #[allow(clippy::cast_precision_loss)]
+    let window = window_secs as f64;
+    now - window
 }
 
 // ---------------------------------------------------------------------------
@@ -143,8 +163,30 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
 
-fn user_clause(user: &Option<String>) -> String {
-    match user.as_deref() {
+/// Liveness: process is up. Never touches dependencies.
+async fn health_live() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok", "version": VERSION }))
+}
+
+/// Readiness: process can serve queries (data dir reachable via DuckDB).
+async fn health_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match open_db(&state.data_dir) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ready", "version": VERSION })),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "readiness check failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "unavailable", "version": VERSION })),
+            )
+        }
+    }
+}
+
+fn user_clause(user: Option<&str>) -> String {
+    match user {
         Some("__system") => r" AND user_name LIKE '\_%'".to_string(),
         Some(u) if !u.is_empty() => format!(" AND user_name = '{}'", u.replace('\'', "''")),
         _ => String::new(),
@@ -156,7 +198,7 @@ async fn api_summary(
     Query(params): Query<WindowParams>,
 ) -> Result<Json<SummaryResponse>, AppError> {
     let conn = open_db(&state.data_dir)?;
-    let uf = user_clause(&params.user);
+    let uf = user_clause(params.user.as_deref());
     let sql = format!(
         "SELECT
             count(DISTINCT pid) as active_procs,
@@ -168,7 +210,8 @@ async fn api_summary(
              WHERE ts > {}{}
              GROUP BY pid
          )",
-        cutoff(params.window), uf
+        cutoff(params.window),
+        uf
     );
     let mut stmt = conn.prepare(&sql)?;
     let row = stmt.query_row([], |r| {
@@ -186,7 +229,7 @@ async fn api_top_cpu(
     Query(params): Query<TopParams>,
 ) -> Result<Json<Vec<TopEntry>>, AppError> {
     let conn = open_db(&state.data_dir)?;
-    let uf = user_clause(&params.user);
+    let uf = user_clause(params.user.as_deref());
     let sql = format!(
         "SELECT name, user_name,
                 round(avg(cpu_percent), 2) as avg_cpu,
@@ -197,7 +240,9 @@ async fn api_top_cpu(
          GROUP BY name, user_name
          ORDER BY avg_cpu DESC
          LIMIT {}",
-        cutoff(params.window), uf, params.limit
+        cutoff(params.window),
+        uf,
+        params.limit
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -218,7 +263,7 @@ async fn api_top_mem(
     Query(params): Query<TopParams>,
 ) -> Result<Json<Vec<TopEntry>>, AppError> {
     let conn = open_db(&state.data_dir)?;
-    let uf = user_clause(&params.user);
+    let uf = user_clause(params.user.as_deref());
     let sql = format!(
         "SELECT name, user_name,
                 round(avg(cpu_percent), 2) as avg_cpu,
@@ -229,7 +274,9 @@ async fn api_top_mem(
          GROUP BY name, user_name
          ORDER BY peak_rss DESC
          LIMIT {}",
-        cutoff(params.window), uf, params.limit
+        cutoff(params.window),
+        uf,
+        params.limit
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -255,7 +302,8 @@ async fn api_timeline(
          FROM proc_metrics
          WHERE pid = {} AND ts > {}
          ORDER BY ts",
-        params.pid, cutoff(params.window)
+        params.pid,
+        cutoff(params.window)
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -292,14 +340,15 @@ async fn api_processes(
     Query(params): Query<WindowParams>,
 ) -> Result<Json<Vec<ProcessEntry>>, AppError> {
     let conn = open_db(&state.data_dir)?;
-    let uf = user_clause(&params.user);
+    let uf = user_clause(params.user.as_deref());
     let sql = format!(
         "SELECT DISTINCT pid, name, user_name, max(ts) as last_seen
          FROM proc_metrics
          WHERE ts > {}{}
          GROUP BY pid, name, user_name
          ORDER BY name",
-        cutoff(params.window), uf
+        cutoff(params.window),
+        uf
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -315,6 +364,36 @@ async fn api_processes(
 }
 
 // ---------------------------------------------------------------------------
+// Router construction (shared by the server and e2e tests)
+// ---------------------------------------------------------------------------
+
+/// Build the API router. Data queries are served under both `/api/v1/*`
+/// (versioned, per the standard) and the legacy `/api/*` paths the embedded
+/// dashboard calls.
+pub fn router(data_dir: PathBuf) -> Router {
+    let state = Arc::new(AppState { data_dir });
+
+    let api = Router::new()
+        .route("/summary", get(api_summary))
+        .route("/top", get(api_top_cpu))
+        .route("/top-mem", get(api_top_mem))
+        .route("/timeline", get(api_timeline))
+        .route("/processes", get(api_processes))
+        .route("/users", get(api_users));
+
+    Router::new()
+        .route("/", get(index))
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
+        .route("/health", get(health_live))
+        .nest("/api/v1", api.clone())
+        .nest("/api", api)
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
+// ---------------------------------------------------------------------------
 // Serve the web dashboard (async — run on the tokio runtime)
 // ---------------------------------------------------------------------------
 
@@ -322,24 +401,15 @@ pub async fn serve_web(bind: String, port: u16, data_dir: PathBuf) -> anyhow::Re
     info!("Web dashboard data dir: {}", data_dir.display());
     info!("Web dashboard listening on {}:{}", bind, port);
 
-    let state = Arc::new(AppState { data_dir });
+    let app = router(data_dir);
 
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/api/summary", get(api_summary))
-        .route("/api/top", get(api_top_cpu))
-        .route("/api/top-mem", get(api_top_mem))
-        .route("/api/timeline", get(api_timeline))
-        .route("/api/processes", get(api_processes))
-        .route("/api/users", get(api_users))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
-
-    let addr: std::net::SocketAddr = format!("{}:{}", bind, port)
+    let addr: std::net::SocketAddr = format!("{bind}:{port}")
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid bind address {bind}:{port}: {e}"))?;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::shutdown_signal())
+        .await?;
     Ok(())
 }

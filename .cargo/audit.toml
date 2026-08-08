@@ -1,0 +1,11 @@
+# cargo-audit configuration. Ignored advisories are transitive with no safe
+# upgrade path; each is documented here and re-reviewed on dependency bumps.
+[advisories]
+ignore = [
+    # `paste` (unmaintained) via `parquet` 53; no safe upgrade without bumping
+    # arrow/parquet (version-pinned per AGENTS.md).
+    "RUSTSEC-2024-0436",
+    # `rkyv` 0.7 OOB read: only reachable via an optional `rust_decimal` feature
+    # (through duckdb) NOT enabled in our build graph (`cargo tree` shows no rkyv).
+    "RUSTSEC-2026-0235",
+]
